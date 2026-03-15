@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# pubspec.lock merge çakışmalarında mevcut branch'i koru
+pubspec.lock merge=ours
