@@ -117,6 +117,8 @@ ios/Runner/GoogleService-Info.plist
 .idea/usage.statistics.xml
 .idea/dictionaries
 .idea/shelf
+.idea/libraries/Dart_SDK.xml
+.idea/libraries/Flutter_Plugins.xml
 
 # Windows
 **/windows/flutter/generated_plugin_registrant.cc
