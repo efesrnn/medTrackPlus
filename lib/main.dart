@@ -15,7 +15,10 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'features/mlkit_test/mlkit_test_screen.dart';
+
 import 'firebase_options.dart';
+
 
 // --- GLOBAL DURUM YÖNETİCİLERİ ---
 final ValueNotifier<AlarmSettings?> globalAlarmState = ValueNotifier<AlarmSettings?>(null);
@@ -202,7 +205,12 @@ class _MyAppState extends State<MyApp> {
           },
         );
       },
-      home: const RootGate(),
+
+
+     // home: const RootGate(),
+      home: const MlkitTestScreen(),
+
+
     );
   }
 }
