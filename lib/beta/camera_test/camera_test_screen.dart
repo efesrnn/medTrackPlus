@@ -45,6 +45,12 @@ class _CameraTestScreenState extends ConsumerState<CameraTestScreen> {
         backgroundColor: Colors.black87,
         foregroundColor: Colors.white,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.cameraswitch_rounded),
+            onPressed: cameraState is CameraPreviewing || cameraState is CameraStreaming
+                ? () => ref.read(cameraProvider.notifier).switchCamera()
+                : null,
+          ),
           Padding(
             padding: const EdgeInsets.only(right: 12),
             child: _StateIndicator(state: cameraState),
@@ -200,12 +206,7 @@ class _CameraPreviewWidget extends StatelessWidget {
     if (!controller.value.isInitialized) {
       return const Center(child: CircularProgressIndicator());
     }
-    return Center(
-      child: AspectRatio(
-        aspectRatio: controller.value.aspectRatio,
-        child: CameraPreview(controller),
-      ),
-    );
+    return CameraPreview(controller);
   }
 }
 
