@@ -103,6 +103,8 @@ class CameraNotifier extends StateNotifier<CameraState> {
     return _cameras!;
   }
 
+  int _currentCameraIndex = 0;
+
   Future<void> initialize({int cameraIndex = 0}) async {
     state = const CameraInitializing();
     try {
@@ -112,8 +114,9 @@ class CameraNotifier extends StateNotifier<CameraState> {
         return;
       }
 
+      _currentCameraIndex = cameraIndex;
       _controller = CameraController(
-        cams[cameraIndex],
+        cams[_currentCameraIndex],
         ResolutionPreset.medium,
         enableAudio: true,
         imageFormatGroup: ImageFormatGroup.yuv420,
@@ -124,6 +127,15 @@ class CameraNotifier extends StateNotifier<CameraState> {
     } catch (e) {
       state = CameraError('Failed to initialize camera: $e', const CameraIdle());
     }
+  }
+
+  Future<void> switchCamera() async {
+    final cams = await cameras;
+    if (cams.length < 2) return;
+
+    await _controller?.dispose();
+    _currentCameraIndex = (_currentCameraIndex + 1) % cams.length;
+    await initialize(cameraIndex: _currentCameraIndex);
   }
 
   /// Starts image stream and processes every [skipFrames+1]th frame via [onFrame].
