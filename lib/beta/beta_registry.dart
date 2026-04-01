@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:medTrackPlus/beta/mlkit_test/mlkit_test_screen.dart';
+import 'package:medTrackPlus/beta/mode_selection_screen.dart';
+import 'package:medTrackPlus/beta/verification_screen/verification_screen.dart';
 
 /// Represents a single beta screen entry.
 class BetaScreen {
@@ -24,6 +26,16 @@ class BetaRegistry {
       name: 'MLKit Face Detection',
       description: 'Face detection & contour painting test',
       builder: (_) => const MlkitTestScreen(),
+    ),
+    BetaScreen(
+      name: 'Verification Screen',
+      description: 'CV pipeline: pill detection + mouth verification',
+      builder: (_) => const VerificationScreen(),
+    ),
+    BetaScreen(
+      name: 'Mode Selection Screen',
+      description: 'Device vs Device-Free mode picker',
+      builder: (_) => const ModeSelectionScreen(),
     ),
   ];
 }

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:medTrackPlus/main.dart'; // AppColors
+import 'package:medTrackPlus/app/developer_screen.dart';
 import 'package:medTrackPlus/app/reports_screen.dart'; // Rapor ekranı
 
 class SettingsScreen extends StatefulWidget {
@@ -89,6 +90,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     context.setLocale(Locale(v == 'tr' ? 'tr' : 'en', v == 'tr' ? 'TR' : 'US'));
                   }
                 }
+            ),
+          ),
+
+          const Divider(),
+
+          // Developer Mode
+          ListTile(
+            leading: const Icon(Icons.code_rounded, color: AppColors.deepSea),
+            title: const Text('Developer Mode'),
+            subtitle: const Text('Beta screens & test tools'),
+            trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const DeveloperScreen()),
             ),
           ),
 
