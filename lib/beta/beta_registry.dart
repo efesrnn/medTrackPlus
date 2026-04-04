@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:medTrackPlus/beta/camera_test/camera_test_screen.dart';
+import 'package:medTrackPlus/beta/camera_test/unified_test_screen.dart';
 import 'package:medTrackPlus/beta/mlkit_test/mlkit_test_screen.dart';
 import 'package:medTrackPlus/beta/mlkit_test/pill_detection_test_screen.dart';
 import 'package:medTrackPlus/beta/mode_selection_screen.dart';
 import 'package:medTrackPlus/beta/verification_screen/verification_screen.dart';
-import 'package:medTrackPlus/beta/camera_test/camera_test_screen.dart';
 
 /// Represents a single beta screen entry.
 class BetaScreen {
@@ -20,10 +21,23 @@ class BetaScreen {
 
 /// Registry of all beta screens under development.
 /// To add a new beta screen:
-///   1. Create your screen file in lib/beta/ (or lib/features/)
-///   2. Import it above and add a BetaScreen entry to the list.
+///   1. Create your screen file in lib/beta/
+///   2. Import it below and add a BetaScreen entry to the list.
 class BetaRegistry {
   static final List<BetaScreen> screens = [
+    // -- Efe: Foundation --
+    BetaScreen(
+      name: 'Mode Selection',
+      description: 'Device vs Device-Free mode picker',
+      builder: (_) => const ModeSelectionScreen(),
+    ),
+    BetaScreen(
+      name: 'Verification Screen',
+      description: 'CV pipeline: pill detection + mouth verification',
+      builder: (_) => const VerificationScreen(),
+    ),
+
+    // -- Ipek: ML Kit --
     BetaScreen(
       name: 'MLKit Face Detection',
       description: 'Face detection & contour painting test',
@@ -31,21 +45,22 @@ class BetaRegistry {
     ),
     BetaScreen(
       name: 'Pill Detection Test',
-      description: 'Face + mouth open + pill on tongue detection',
+      description: 'ML Kit pill-on-tongue detection pipeline test',
       builder: (_) => const PillDetectionTestScreen(),
     ),
+
+    // -- Ecenaz: Camera & State Machine --
     BetaScreen(
-      name: 'Verification Screen',
-      description: 'CV pipeline: pill detection + mouth verification',
-      builder: (_) => const VerificationScreen(),
-    ),
-    BetaScreen(
-      name: 'Mode Selection Screen',
-      description: 'Device vs Device-Free mode picker',
-      builder: (_) => const ModeSelectionScreen(),
       name: 'Camera Test',
-      description: 'CV Processor & Video Upload',
+      description: 'CV Processor, video recording & upload',
       builder: (_) => const CameraTestScreen(),
+    ),
+
+    // -- Merged: Ipek + Ecenaz --
+    BetaScreen(
+      name: 'Unified Detection Test',
+      description: 'ML Kit detection + video recording + upload (birlesik)',
+      builder: (_) => const UnifiedTestScreen(),
     ),
   ];
 }

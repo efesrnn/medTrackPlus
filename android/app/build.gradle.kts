@@ -21,8 +21,7 @@ plugins {
 
 android {
     namespace = "com.example.medTrackPlus"
-    // compileSdk 34 veya 35 önerilir (Google Play politikası için)
-    compileSdk = 35
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -88,4 +87,6 @@ configurations.all {
         force("io.flutter.plugins.camera:camera_android:+")
     }
     exclude(group = "io.flutter.plugins.camerax", module = "camera_android_camerax")
+    // firebase-iid, firebase-messaging ile duplicate class çakışması yaratıyor
+    exclude(group = "com.google.firebase", module = "firebase-iid")
 }
