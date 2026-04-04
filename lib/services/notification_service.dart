@@ -16,6 +16,64 @@ class NotificationService {
   // Bu sayede uygulama açılır açılmaz stok kontrolünü taze bir şekilde yapacak.
   static const String _lastStockNotifKey = 'last_stock_notif_v2_';
 
+  // --- FCM TOKEN YÖNETİMİ ---
+
+  /// FCM token'ı alır ve Firestore users/{uid}/fcmTokens array'ine kaydeder.
+  static Future<void> registerFcmToken(String uid) async {
+    try {
+      final fcm = FirebaseMessaging.instance;
+      final token = await fcm.getToken();
+      if (token != null) {
+        await FirebaseFirestore.instance.collection('users').doc(uid).set({
+          'fcmTokens': FieldValue.arrayUnion([token]),
+        }, SetOptions(merge: true));
+        debugPrint('FCM token registered: ${token.substring(0, 20)}...');
+      }
+
+      // Token yenilendiğinde otomatik güncelle
+      fcm.onTokenRefresh.listen((newToken) async {
+        if (token != null) {
+          await FirebaseFirestore.instance.collection('users').doc(uid).update({
+            'fcmTokens': FieldValue.arrayRemove([token]),
+          });
+        }
+        await FirebaseFirestore.instance.collection('users').doc(uid).update({
+          'fcmTokens': FieldValue.arrayUnion([newToken]),
+        });
+        debugPrint('FCM token refreshed.');
+      });
+    } catch (e) {
+      debugPrint('FCM token registration error: $e');
+    }
+  }
+
+  /// Foreground FCM mesajlarını dinler ve AwesomeNotifications ile gösterir.
+  static void listenForegroundMessages() {
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      final notification = message.notification;
+      if (notification == null) return;
+
+      final data = message.data;
+      final String classification = data['classification'] ?? '';
+
+      String channelKey = classification == 'rejected'
+          ? 'stock_warning_channel'
+          : 'reminder_channel';
+
+      AwesomeNotifications().createNotification(
+        content: NotificationContent(
+          id: DateTime.now().millisecondsSinceEpoch.remainder(100000),
+          channelKey: channelKey,
+          title: notification.title ?? 'MedTrack',
+          body: notification.body ?? '',
+          notificationLayout: NotificationLayout.Default,
+          category: NotificationCategory.Reminder,
+          icon: 'resource://drawable/notification_bar_icon',
+        ),
+      );
+    });
+  }
+
   // --- BAŞLATMA ---
   static Future<void> initializeNotifications() async {
     await Alarm.init();
@@ -44,66 +102,6 @@ class NotificationService {
       ],
       debug: false,
     );
-  }
-
-  // --- FCM TOKEN YÖNETİMİ ---
-
-  /// FCM token'ı alır ve Firestore users/{uid}/fcmTokens array'ine kaydeder.
-  static Future<void> registerFcmToken(String uid) async {
-    try {
-      final fcm = FirebaseMessaging.instance;
-      final token = await fcm.getToken();
-      if (token != null) {
-        await FirebaseFirestore.instance.collection('users').doc(uid).set({
-          'fcmTokens': FieldValue.arrayUnion([token]),
-        }, SetOptions(merge: true));
-        debugPrint('FCM token registered: ${token.substring(0, 20)}...');
-      }
-
-      // Token yenilendiğinde otomatik güncelle
-      fcm.onTokenRefresh.listen((newToken) async {
-        // Eski token'ı kaldırıp yenisini ekle
-        if (token != null) {
-          await FirebaseFirestore.instance.collection('users').doc(uid).update({
-            'fcmTokens': FieldValue.arrayRemove([token]),
-          });
-        }
-        await FirebaseFirestore.instance.collection('users').doc(uid).update({
-          'fcmTokens': FieldValue.arrayUnion([newToken]),
-        });
-        debugPrint('FCM token refreshed.');
-      });
-    } catch (e) {
-      debugPrint('FCM token registration error: $e');
-    }
-  }
-
-  /// Foreground FCM mesajlarını dinler ve AwesomeNotifications ile gösterir.
-  static void listenForegroundMessages() {
-    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
-      final notification = message.notification;
-      if (notification == null) return;
-
-      final data = message.data;
-      final String classification = data['classification'] ?? '';
-
-      // Classification'a göre kanal seç
-      String channelKey = classification == 'rejected'
-          ? 'stock_warning_channel'
-          : 'reminder_channel';
-
-      AwesomeNotifications().createNotification(
-        content: NotificationContent(
-          id: DateTime.now().millisecondsSinceEpoch.remainder(100000),
-          channelKey: channelKey,
-          title: notification.title ?? 'MedTrack',
-          body: notification.body ?? '',
-          notificationLayout: NotificationLayout.Default,
-          category: NotificationCategory.Reminder,
-          icon: 'resource://drawable/notification_bar_icon',
-        ),
-      );
-    });
   }
 
   static Future<void> requestPermission() async {
