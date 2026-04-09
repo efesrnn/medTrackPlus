@@ -48,6 +48,9 @@ class PillOnTongueService {
   // Mouth open threshold (ratio of lip distance / face height)
   static const double _mouthOpenThreshold = 0.08;
 
+  // Maximum head angle (yaw/pitch) to accept as frontal
+  static const double _maxFrontalAngle = 25.0;
+
   // Pill detection: minimum white-ish pixel ratio in mouth region
   static const double _pillPixelThreshold = 0.05; // 5% of mouth area
   static const double _pillConfidenceThreshold = 0.4;
@@ -65,6 +68,8 @@ class PillOnTongueService {
       options: FaceDetectorOptions(
         performanceMode: FaceDetectorMode.fast,
         enableContours: true,
+        enableClassification: true,
+        enableLandmarks: true,
       ),
     );
   }
@@ -89,7 +94,23 @@ class PillOnTongueService {
 
     final face = faces.first;
 
-    // Step 2: Check mouth open
+    // Step 2: Check face angle — reject non-frontal poses
+    final yaw = face.headEulerAngleY;
+    final pitch = face.headEulerAngleX;
+    if ((yaw != null && yaw.abs() > _maxFrontalAngle) ||
+        (pitch != null && pitch.abs() > _maxFrontalAngle)) {
+      _consecutivePillFrames = 0;
+      return PillOnTongueResult(
+        phase: DetectionPhase.faceDetected,
+        face: face,
+        mouthOpenRatio: 0.0,
+        pillConfidence: 0.0,
+        guidance: 'Lütfen yüzünüzü doğrudan kameraya çevirin',
+        timestamp: DateTime.now(),
+      );
+    }
+
+    // Step 3: Check mouth open
     final mouthOpenRatio = _calculateMouthOpenRatio(face);
 
     if (mouthOpenRatio < _mouthOpenThreshold) {
@@ -104,7 +125,7 @@ class PillOnTongueService {
       );
     }
 
-    // Step 3: Mouth is open — analyze mouth region for pill
+    // Step 4: Mouth is open — analyze mouth region for pill
     final mouthRect = _getMouthRegion(face);
     if (mouthRect == null) {
       return PillOnTongueResult(
@@ -161,6 +182,9 @@ class PillOnTongueService {
     );
   }
 
+  /// Multi-point median mouth open ratio using inner lip contours.
+  /// Samples corresponding points along upper and lower inner lips,
+  /// then takes the median vertical gap for noise robustness.
   double _calculateMouthOpenRatio(Face face) {
     final upperLipBottom = face.contours[FaceContourType.upperLipBottom];
     final lowerLipTop = face.contours[FaceContourType.lowerLipTop];
@@ -168,25 +192,30 @@ class PillOnTongueService {
     if (upperLipBottom == null || lowerLipTop == null) return 0.0;
     if (upperLipBottom.points.isEmpty || lowerLipTop.points.isEmpty) return 0.0;
 
-    // Calculate vertical distance between inner lips (mouth gap)
-    final upperCenter = _centerOf(upperLipBottom.points);
-    final lowerCenter = _centerOf(lowerLipTop.points);
-    final lipGap = (lowerCenter.dy - upperCenter.dy).abs();
-
     final faceHeight = face.boundingBox.height;
     if (faceHeight <= 0) return 0.0;
 
-    return lipGap / faceHeight;
-  }
+    // Sort by x for left-to-right correspondence
+    final upperSorted = List<Point<int>>.from(upperLipBottom.points)
+      ..sort((a, b) => a.x.compareTo(b.x));
+    final lowerSorted = List<Point<int>>.from(lowerLipTop.points)
+      ..sort((a, b) => a.x.compareTo(b.x));
 
-  Offset _centerOf(List<Point<int>> points) {
-    if (points.isEmpty) return Offset.zero;
-    double sx = 0, sy = 0;
-    for (final p in points) {
-      sx += p.x;
-      sy += p.y;
+    final sampleCount = min(upperSorted.length, lowerSorted.length);
+    if (sampleCount == 0) return 0.0;
+
+    final gaps = <double>[];
+    for (int i = 0; i < sampleCount; i++) {
+      final uIdx = (i * (upperSorted.length - 1)) ~/ max(1, sampleCount - 1);
+      final lIdx = (i * (lowerSorted.length - 1)) ~/ max(1, sampleCount - 1);
+      final gap = (lowerSorted[lIdx].y - upperSorted[uIdx].y).abs().toDouble();
+      gaps.add(gap);
     }
-    return Offset(sx / points.length, sy / points.length);
+
+    gaps.sort();
+    final medianGap = gaps[gaps.length ~/ 2];
+
+    return medianGap / faceHeight;
   }
 
   Rect? _getMouthRegion(Face face) {

@@ -17,9 +17,11 @@ class _PillDetectionTestScreenState extends State<PillDetectionTestScreen> {
   CameraController? _cameraController;
   bool _isCameraInitialized = false;
   bool _isProcessing = false;
+  bool _isFrontCamera = false;
   late PillOnTongueService _service;
   PillOnTongueResult _lastResult = PillOnTongueResult.empty();
   Size _imageSize = const Size(480, 640);
+  InputImageRotation _rotation = InputImageRotation.rotation0deg;
 
   @override
   void initState() {
@@ -28,44 +30,96 @@ class _PillDetectionTestScreenState extends State<PillDetectionTestScreen> {
     _initCamera();
   }
 
+
   Future<void> _initCamera() async {
     try {
+      debugPrint('[PillDetection] Requesting camera permission...');
       final status = await Permission.camera.request();
+      debugPrint('[PillDetection] Permission status: $status');
       if (!status.isGranted) {
         setState(() => _lastResult = PillOnTongueResult(
               phase: DetectionPhase.noFace,
               mouthOpenRatio: 0.0,
               pillConfidence: 0.0,
-              guidance: 'Kamera izni verilmedi',
+              guidance: 'Kamera izni verilmedi ($status)',
               timestamp: DateTime.now(),
             ));
         return;
       }
 
+      debugPrint('[PillDetection] Getting available cameras...');
       final cameras = await availableCameras();
-      if (cameras.isEmpty) return;
+      debugPrint('[PillDetection] Found ${cameras.length} cameras');
+      for (final cam in cameras) {
+        debugPrint('[PillDetection] Camera: ${cam.name}, lens: ${cam.lensDirection}');
+      }
+      if (cameras.isEmpty) {
+        setState(() => _lastResult = PillOnTongueResult(
+              phase: DetectionPhase.noFace,
+              mouthOpenRatio: 0.0,
+              pillConfidence: 0.0,
+              guidance: 'Kamera bulunamadı',
+              timestamp: DateTime.now(),
+            ));
+        return;
+      }
 
-      // Front camera for face/mouth detection
-      final camera = cameras.firstWhere(
+      // Try front camera first, then back camera as fallback
+      final front = cameras.where(
         (c) => c.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
       );
-
-      _cameraController = CameraController(
-        camera,
-        ResolutionPreset.medium,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.nv21,
+      final back = cameras.where(
+        (c) => c.lensDirection == CameraLensDirection.back,
       );
+      final orderedCameras = [...front, ...back, ...cameras]
+          .toSet()
+          .toList();
 
-      await _cameraController!.initialize();
-      if (!mounted) return;
+      for (final camera in orderedCameras) {
+        try {
+          debugPrint('[PillDetection] Trying camera: ${camera.name}, lens: ${camera.lensDirection}');
+          _cameraController = CameraController(
+            camera,
+            ResolutionPreset.medium,
+            enableAudio: false,
+            imageFormatGroup: ImageFormatGroup.nv21,
+          );
 
-      setState(() {
-        _isCameraInitialized = true;
-      });
+          await _cameraController!.initialize().timeout(
+            const Duration(seconds: 10),
+            onTimeout: () {
+              throw Exception('Camera initialize timeout');
+            },
+          );
+          if (!mounted) return;
 
-      await _cameraController!.startImageStream(_onFrame);
+          _isFrontCamera = camera.lensDirection == CameraLensDirection.front;
+          _rotation = InputImageRotationValue.fromRawValue(
+                camera.sensorOrientation,
+              ) ??
+              InputImageRotation.rotation0deg;
+
+          setState(() {
+            _isCameraInitialized = true;
+          });
+
+          await _cameraController!.startImageStream(_onFrame);
+          return; // Success
+        } catch (e) {
+          debugPrint('[PillDetection] Camera ${camera.name} failed: $e');
+          _cameraController?.dispose();
+          _cameraController = null;
+        }
+      }
+
+      // All cameras failed
+      setState(() => _lastResult = PillOnTongueResult(
+            phase: DetectionPhase.noFace,
+            mouthOpenRatio: 0.0,
+            pillConfidence: 0.0,
+            guidance: 'Kamera başlatılamadı',
+            timestamp: DateTime.now(),
+          ));
     } catch (e) {
       debugPrint('Camera error: $e');
     }
@@ -197,6 +251,8 @@ class _PillDetectionTestScreenState extends State<PillDetectionTestScreen> {
                             painter: PillPainter(
                               result: _lastResult,
                               imageSize: _imageSize,
+                              rotation: _rotation,
+                              isFrontCamera: _isFrontCamera,
                             ),
                           ),
                         ),

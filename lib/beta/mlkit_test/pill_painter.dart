@@ -5,10 +5,14 @@ import 'pill_detection_service.dart';
 class PillPainter extends CustomPainter {
   final PillOnTongueResult result;
   final Size imageSize;
+  final InputImageRotation rotation;
+  final bool isFrontCamera;
 
   PillPainter({
     required this.result,
     required this.imageSize,
+    this.rotation = InputImageRotation.rotation0deg,
+    this.isFrontCamera = false,
   });
 
   @override
@@ -16,12 +20,8 @@ class PillPainter extends CustomPainter {
     final face = result.face;
     if (face == null) return;
 
-    // We don't scale since face contour coordinates are in image space
-    // and the preview fills the widget — but we need to handle potential
-    // coordinate mapping. For front camera, x may be mirrored.
-
-    // Draw face bounding box (subtle)
-    final faceRect = face.boundingBox;
+    // Draw face bounding box
+    final faceRect = _transformRect(face.boundingBox, size);
     final facePaint = Paint()
       ..color = _phaseColor(result.phase).withValues(alpha: 0.5)
       ..style = PaintingStyle.stroke
@@ -29,16 +29,18 @@ class PillPainter extends CustomPainter {
     canvas.drawRect(faceRect, facePaint);
 
     // Draw lip contours
-    _drawLipContours(canvas, face);
+    _drawLipContours(canvas, size, face);
 
     // Draw mouth region highlight if mouth is open
     if (result.mouthRegion != null && result.phase.index >= 2) {
+      final mouthRect = _transformRect(result.mouthRegion!, size);
+
       final mouthPaint = Paint()
         ..color = result.phase == DetectionPhase.pillDetected
             ? Colors.green.withValues(alpha: 0.3)
             : Colors.blue.withValues(alpha: 0.2)
         ..style = PaintingStyle.fill;
-      canvas.drawRect(result.mouthRegion!, mouthPaint);
+      canvas.drawRect(mouthRect, mouthPaint);
 
       final mouthBorderPaint = Paint()
         ..color = result.phase == DetectionPhase.pillDetected
@@ -46,7 +48,7 @@ class PillPainter extends CustomPainter {
             : Colors.blue
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2.0;
-      canvas.drawRect(result.mouthRegion!, mouthBorderPaint);
+      canvas.drawRect(mouthRect, mouthBorderPaint);
 
       // Label
       final label = result.phase == DetectionPhase.pillDetected
@@ -71,12 +73,12 @@ class PillPainter extends CustomPainter {
 
       textPainter.paint(
         canvas,
-        Offset(result.mouthRegion!.left, result.mouthRegion!.top - 18),
+        Offset(mouthRect.left, mouthRect.top - 18),
       );
     }
   }
 
-  void _drawLipContours(Canvas canvas, Face face) {
+  void _drawLipContours(Canvas canvas, Size canvasSize, Face face) {
     final lipColor = result.phase == DetectionPhase.pillDetected
         ? Colors.greenAccent
         : result.phase == DetectionPhase.mouthOpen
@@ -98,13 +100,58 @@ class PillPainter extends CustomPainter {
       final contour = face.contours[type];
       if (contour == null) continue;
       for (final point in contour.points) {
-        canvas.drawCircle(
+        final transformed = _transformPoint(
           Offset(point.x.toDouble(), point.y.toDouble()),
-          2.5,
-          lipPaint,
+          canvasSize,
         );
+        canvas.drawCircle(transformed, 2.5, lipPaint);
       }
     }
+  }
+
+  /// Transform a point from image coordinates to canvas coordinates,
+  /// accounting for rotation and camera mirroring.
+  Offset _transformPoint(Offset point, Size canvasSize) {
+    double x = point.dx;
+    double y = point.dy;
+
+    // The image size as seen by ML Kit depends on the rotation
+    final Size rotatedSize = _isRotated90or270()
+        ? Size(imageSize.height, imageSize.width)
+        : imageSize;
+
+    // Scale from image space to canvas space
+    final scaleX = canvasSize.width / rotatedSize.width;
+    final scaleY = canvasSize.height / rotatedSize.height;
+
+    x = x * scaleX;
+    y = y * scaleY;
+
+    // Mirror x for front camera
+    if (isFrontCamera) {
+      x = canvasSize.width - x;
+    }
+
+    return Offset(x, y);
+  }
+
+  /// Transform a rect from image coordinates to canvas coordinates.
+  Rect _transformRect(Rect rect, Size canvasSize) {
+    final topLeft = _transformPoint(rect.topLeft, canvasSize);
+    final bottomRight = _transformPoint(rect.bottomRight, canvasSize);
+
+    // After mirroring, left/right may swap
+    return Rect.fromLTRB(
+      topLeft.dx < bottomRight.dx ? topLeft.dx : bottomRight.dx,
+      topLeft.dy < bottomRight.dy ? topLeft.dy : bottomRight.dy,
+      topLeft.dx > bottomRight.dx ? topLeft.dx : bottomRight.dx,
+      topLeft.dy > bottomRight.dy ? topLeft.dy : bottomRight.dy,
+    );
+  }
+
+  bool _isRotated90or270() {
+    return rotation == InputImageRotation.rotation90deg ||
+        rotation == InputImageRotation.rotation270deg;
   }
 
   Color _phaseColor(DetectionPhase phase) {

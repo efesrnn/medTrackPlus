@@ -19,6 +19,7 @@ class _MlkitTestScreenState extends State<MlkitTestScreen> {
   CameraController? _cameraController;
   bool _isCameraInitialized = false;
   bool _isStreaming = false;
+  bool _isFrontCamera = false;
   String _debugText = 'Stream başlamadı';
 
   bool _isProcessing = false;
@@ -26,6 +27,8 @@ class _MlkitTestScreenState extends State<MlkitTestScreen> {
   List<Face> _faces = [];
   double _mouthOpenRatio = 0.0;
   bool _isMouthOpen = false;
+  Size _imageSize = const Size(480, 640);
+  InputImageRotation _rotation = InputImageRotation.rotation0deg;
 
   @override
   void initState() {
@@ -60,74 +63,104 @@ class _MlkitTestScreenState extends State<MlkitTestScreen> {
         debugPrint('Camera: ${cam.name}, lens: ${cam.lensDirection}');
       }
 
-      // Ön kamerayı seç (yüz tespiti için)
-      final selectedCamera = cameras.firstWhere(
+      // Try front camera first, then back camera as fallback
+      final front = cameras.where(
         (c) => c.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
       );
-
-      _cameraController = CameraController(
-        selectedCamera,
-        ResolutionPreset.medium,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.nv21,
+      final back = cameras.where(
+        (c) => c.lensDirection == CameraLensDirection.back,
       );
+      final orderedCameras = [...front, ...back, ...cameras]
+          .toSet()
+          .toList();
 
-      await _cameraController!.initialize();
-
-      if (!mounted) return;
-
-      if (!_cameraController!.value.isInitialized) {
-        setState(() {
-          _debugText = 'Kamera initialize edilemedi';
-        });
-        return;
-      }
-
-      setState(() {
-        _isCameraInitialized = true;
-        _debugText = 'Kamera initialize oldu';
-      });
-
-      await _cameraController!.startImageStream((image) async {
-        if (!_isStreaming) {
-          _isStreaming = true;
-        }
-
-        if (_isProcessing) return;
-        _isProcessing = true;
-
+      for (final camera in orderedCameras) {
         try {
-          final inputImage = _inputImageFromCameraImage(image);
-          if (inputImage == null) {
-            setState(() {
-              _debugText =
-              'InputImage oluşturulamadı | Format group: ${image.format.group}';
-            });
-            return;
+          debugPrint('[MlkitTest] Trying camera: ${camera.name}, lens: ${camera.lensDirection}');
+          _cameraController = CameraController(
+            camera,
+            ResolutionPreset.medium,
+            enableAudio: false,
+            imageFormatGroup: ImageFormatGroup.nv21,
+          );
+
+          await _cameraController!.initialize().timeout(
+            const Duration(seconds: 10),
+            onTimeout: () {
+              throw Exception('Camera initialize timeout');
+            },
+          );
+          if (!mounted) return;
+
+          if (!_cameraController!.value.isInitialized) {
+            debugPrint('[MlkitTest] Camera ${camera.name} not initialized, trying next');
+            _cameraController?.dispose();
+            _cameraController = null;
+            continue;
           }
 
-          final result = await _faceDetectionService.processImage(inputImage);
+          _isFrontCamera = camera.lensDirection == CameraLensDirection.front;
+          _rotation = InputImageRotationValue.fromRawValue(
+                camera.sensorOrientation,
+              ) ??
+              InputImageRotation.rotation0deg;
 
           setState(() {
-            _faces = result.face != null ? [result.face!] : [];
-            _mouthOpenRatio = result.mouthOpenRatio;
-            _isMouthOpen = result.isMouthOpen;
-
-            _debugText =
-            'Faces: ${result.faceDetected ? 1 : 0} | '
-                'Ratio: ${result.mouthOpenRatio.toStringAsFixed(3)} | '
-                'Mouth: ${result.isMouthOpen ? "OPEN" : "CLOSED"}';
+            _isCameraInitialized = true;
+            _debugText = 'Kamera initialize oldu (${camera.lensDirection})';
           });
+
+          await _cameraController!.startImageStream((image) async {
+            if (!_isStreaming) {
+              _isStreaming = true;
+            }
+
+            if (_isProcessing) return;
+            _isProcessing = true;
+
+            try {
+              final inputImage = _inputImageFromCameraImage(image);
+              if (inputImage == null) {
+                setState(() {
+                  _debugText =
+                  'InputImage oluşturulamadı | Format group: ${image.format.group}';
+                });
+                return;
+              }
+
+              final result = await _faceDetectionService.processImage(inputImage);
+
+              setState(() {
+                _faces = result.face != null ? [result.face!] : [];
+                _mouthOpenRatio = result.mouthOpenRatio;
+                _isMouthOpen = result.isMouthOpen;
+                _imageSize = Size(image.width.toDouble(), image.height.toDouble());
+
+                _debugText =
+                'Faces: ${result.faceDetected ? 1 : 0} | '
+                    'Ratio: ${result.mouthOpenRatio.toStringAsFixed(3)} | '
+                    'Mouth: ${result.isMouthOpen ? "OPEN" : "CLOSED"}';
+              });
+            } catch (e) {
+              setState(() {
+                _debugText = 'Face detection error: $e';
+              });
+            } finally {
+              _isProcessing = false;
+            }
+          });
+          return; // Success — stop trying cameras
         } catch (e) {
-          setState(() {
-            _debugText = 'Face detection error: $e';
-          });
-        } finally {
-          _isProcessing = false;
+          debugPrint('[MlkitTest] Camera ${camera.name} failed: $e');
+          _cameraController?.dispose();
+          _cameraController = null;
         }
-      });
+      }
 
+      // All cameras failed
+      setState(() {
+        _debugText = 'Hiçbir kamera başlatılamadı';
+      });
     } catch (e) {
       setState(() {
         _debugText = 'Kamera hatası: $e';
@@ -189,7 +222,12 @@ class _MlkitTestScreenState extends State<MlkitTestScreen> {
           ),
           Positioned.fill(
             child: CustomPaint(
-              painter: FacePainter(_faces),
+              painter: FacePainter(
+                _faces,
+                imageSize: _imageSize,
+                rotation: _rotation,
+                isFrontCamera: _isFrontCamera,
+              ),
             ),
           ),
           Positioned(

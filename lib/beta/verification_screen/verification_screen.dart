@@ -32,8 +32,11 @@ class _VerificationScreenState extends State<VerificationScreen>
   // ── Camera ────────────────────────────────────────────────────────────────
   CameraController? _controller;
   bool _isCameraReady = false;
+  bool _isFrontCamera = false;
   bool _torchOn = false;
   bool _isProcessingFrame = false;
+  Size _imageSize = const Size(480, 640);
+  InputImageRotation _rotation = InputImageRotation.rotation0deg;
 
   // ── Face detection ────────────────────────────────────────────────────────
   final FaceDetectionService _faceDetectionService = FaceDetectionService();
@@ -69,25 +72,62 @@ class _VerificationScreenState extends State<VerificationScreen>
   }
 
   Future<void> _initCamera() async {
-    final cameras = await availableCameras();
-    final front = cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.front,
-      orElse: () => cameras.first,
-    );
-
-    final controller = CameraController(
-      front,
-      ResolutionPreset.medium,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.nv21,
-    );
-
     try {
-      await controller.initialize();
-      if (!mounted) return;
-      _controller = controller;
-      setState(() => _isCameraReady = true);
-      _startStreaming();
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        debugPrint('[VerificationScreen] No cameras found');
+        return;
+      }
+
+      // Try front camera first, then back camera as fallback
+      final front = cameras.where(
+        (c) => c.lensDirection == CameraLensDirection.front,
+      );
+      final back = cameras.where(
+        (c) => c.lensDirection == CameraLensDirection.back,
+      );
+
+      // Order: front cameras first, then back, then any remaining
+      final orderedCameras = [...front, ...back, ...cameras]
+          .toSet()
+          .toList();
+
+      for (final camera in orderedCameras) {
+        try {
+          debugPrint('[VerificationScreen] Trying camera: ${camera.name}, lens: ${camera.lensDirection}');
+          final controller = CameraController(
+            camera,
+            ResolutionPreset.medium,
+            enableAudio: false,
+            imageFormatGroup: ImageFormatGroup.nv21,
+          );
+
+          await controller.initialize().timeout(
+            const Duration(seconds: 10),
+            onTimeout: () {
+              throw Exception('Camera initialize timeout');
+            },
+          );
+          if (!mounted) {
+            controller.dispose();
+            return;
+          }
+
+          _controller = controller;
+          _isFrontCamera = camera.lensDirection == CameraLensDirection.front;
+          _rotation = InputImageRotationValue.fromRawValue(
+                camera.sensorOrientation,
+              ) ??
+              InputImageRotation.rotation0deg;
+          setState(() => _isCameraReady = true);
+          _startStreaming();
+          return; // Success — stop trying
+        } catch (e) {
+          debugPrint('[VerificationScreen] Camera ${camera.name} failed: $e');
+        }
+      }
+
+      debugPrint('[VerificationScreen] All cameras failed to initialize');
     } catch (e) {
       debugPrint('[VerificationScreen] Camera init error: $e');
     }
@@ -110,6 +150,7 @@ class _VerificationScreenState extends State<VerificationScreen>
   }
 
   Future<void> _processFrame(CameraImage image) async {
+    _imageSize = Size(image.width.toDouble(), image.height.toDouble());
     final inputImage = _buildInputImage(image);
     if (inputImage == null) return;
 
@@ -139,6 +180,10 @@ class _VerificationScreenState extends State<VerificationScreen>
       lipContour: lipContour,
       mouthOpenRatio: result.mouthOpenRatio,
       faceBoundingBox: result.face?.boundingBox ?? Rect.zero,
+      headYaw: result.headYaw,
+      headPitch: result.headPitch,
+      headRoll: result.headRoll,
+      isFaceFrontal: result.isFaceFrontal,
       timestamp: DateTime.now(),
     );
 
@@ -292,6 +337,9 @@ class _VerificationScreenState extends State<VerificationScreen>
             CustomPaint(
               painter: FacePainter(
                 _lastResult!.face != null ? [_lastResult!.face!] : [],
+                imageSize: _imageSize,
+                rotation: _rotation,
+                isFrontCamera: _isFrontCamera,
               ),
             ),
 
