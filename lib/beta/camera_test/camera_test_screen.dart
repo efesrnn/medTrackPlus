@@ -97,6 +97,7 @@ class _CameraTestScreenState extends ConsumerState<CameraTestScreen> {
       CameraPreviewing(:final controller) => _CameraPreviewWidget(controller: controller),
       CameraStreaming(:final controller) => _CameraPreviewWidget(controller: controller),
       CameraRecording(:final controller) => Stack(
+          fit: StackFit.expand,
           children: [
             _CameraPreviewWidget(controller: controller),
             Positioned(
