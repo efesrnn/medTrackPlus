@@ -105,6 +105,9 @@ class CameraNotifier extends StateNotifier<CameraState> {
 
   int _currentCameraIndex = 0;
 
+  /// Exposes the current state for non-notifier consumers.
+  CameraState get currentState => state;
+
   Future<void> initialize({int cameraIndex = 0}) async {
     state = const CameraInitializing();
     try {

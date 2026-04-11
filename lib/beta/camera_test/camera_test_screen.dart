@@ -1,10 +1,13 @@
 library;
 
+import 'dart:math';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:medTrackPlus/beta/core/interfaces/cv_processor.dart';
+import 'package:medTrackPlus/beta/models/cv_frame_data.dart';
 import 'camera_state.dart';
-import 'mock_cv_processor.dart';
+import 'camera_stream_manager.dart';
 import 'video_service.dart';
 
 class CameraTestScreen extends ConsumerStatefulWidget {
@@ -15,22 +18,21 @@ class CameraTestScreen extends ConsumerStatefulWidget {
 }
 
 class _CameraTestScreenState extends ConsumerState<CameraTestScreen> {
-  late final MockCvProcessor _cvProcessor;
+  late final CameraStreamManager _manager;
 
   @override
   void initState() {
     super.initState();
-    _cvProcessor = MockCvProcessor(
-      simulatedDelay: const Duration(milliseconds: 30),
+    _manager = CameraStreamManager(
+      cvProcessor: _MockCVProcessor(),
+      cameraNotifier: ref.read(cameraProvider.notifier),
     );
-    Future.microtask(() {
-      ref.read(cameraProvider.notifier).initialize();
-    });
+    Future.microtask(() => _manager.open());
   }
 
   @override
   void dispose() {
-    _cvProcessor.dispose();
+    _manager.stopStream();
     super.dispose();
   }
 
@@ -61,7 +63,8 @@ class _CameraTestScreenState extends ConsumerState<CameraTestScreen> {
         children: [
           Expanded(child: _buildPreview(cameraState)),
 
-          if (cameraState is CameraStreaming) _CvResultPanel(state: cameraState),
+          if (cameraState is CameraStreaming)
+            _CvResultPanel(state: cameraState, bufferCount: _manager.videoBuffer.length),
 
           if (cameraState is CameraCompressing)
             _ProgressBar(
@@ -140,7 +143,7 @@ class _CameraTestScreenState extends ConsumerState<CameraTestScreen> {
                 icon: Icons.visibility_off,
                 label: 'Stop',
                 color: Colors.orange,
-                onPressed: () => ref.read(cameraProvider.notifier).stopStreaming(),
+                onPressed: () => _manager.stopStream(),
               ),
             ],
           CameraRecording() => [
@@ -165,10 +168,7 @@ class _CameraTestScreenState extends ConsumerState<CameraTestScreen> {
   }
 
   void _startStreaming() {
-    ref.read(cameraProvider.notifier).startStreaming(
-      onFrame: (image) => _cvProcessor.processFrame(image),
-      skipFrames: 2,
-    );
+    _manager.startStream();
   }
 
   Future<void> _stopAndUpload() async {
@@ -206,7 +206,16 @@ class _CameraPreviewWidget extends StatelessWidget {
     if (!controller.value.isInitialized) {
       return const Center(child: CircularProgressIndicator());
     }
-    return CameraPreview(controller);
+    return ClipRect(
+      child: FittedBox(
+        fit: BoxFit.cover,
+        child: SizedBox(
+          width: controller.value.previewSize!.height,
+          height: controller.value.previewSize!.width,
+          child: CameraPreview(controller),
+        ),
+      ),
+    );
   }
 }
 
@@ -234,7 +243,8 @@ class _StateIndicator extends StatelessWidget {
 
 class _CvResultPanel extends StatelessWidget {
   final CameraStreaming state;
-  const _CvResultPanel({required this.state});
+  final int bufferCount;
+  const _CvResultPanel({required this.state, this.bufferCount = 0});
 
   @override
   Widget build(BuildContext context) {
@@ -248,6 +258,7 @@ class _CvResultPanel extends StatelessWidget {
             mainAxisAlignment: MainAxisAlignment.spaceAround,
             children: [
               _InfoChip('Frames', '${state.frameCount}'),
+              _InfoChip('Buffer', '$bufferCount'),
               if (state.lastResult != null) ...[
                 _InfoChip('Objects', '${state.lastResult!.detectedObjects}'),
                 _InfoChip(
@@ -427,6 +438,32 @@ class _ErrorPanel extends StatelessWidget {
       ),
     );
   }
+}
+
+// -- Mock CVProcessor (implements real interface, returns CVFrameData) --
+
+class _MockCVProcessor implements CVProcessor {
+  final Random _rng = Random();
+
+  @override
+  Future<CVFrameData> processFrame(CameraImage frame) async {
+    await Future.delayed(const Duration(milliseconds: 40));
+    final pill = _rng.nextDouble() > 0.5;
+    final face = _rng.nextDouble() > 0.3;
+    return CVFrameData(
+      pillDetected: pill,
+      pillConfidence: pill ? 0.6 + _rng.nextDouble() * 0.4 : 0.0,
+      pillBoundingBox: pill ? const Rect.fromLTWH(0.3, 0.4, 0.1, 0.1) : Rect.zero,
+      faceDetected: face,
+      lipContour: const [],
+      mouthOpenRatio: face ? _rng.nextDouble() * 0.15 : 0.0,
+      faceBoundingBox: face ? const Rect.fromLTWH(0.2, 0.1, 0.6, 0.7) : Rect.zero,
+      timestamp: DateTime.now(),
+    );
+  }
+
+  @override
+  Future<void> dispose() async {}
 }
 
 class _ControlButton extends StatelessWidget {
