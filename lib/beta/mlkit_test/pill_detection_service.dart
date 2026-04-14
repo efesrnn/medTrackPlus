@@ -8,6 +8,7 @@ enum DetectionPhase {
   faceDetected,
   mouthOpen,
   pillDetected,
+  pillDisappeared,
 }
 
 class PillOnTongueResult {
@@ -21,6 +22,12 @@ class PillOnTongueResult {
   final String guidance;
   final DateTime timestamp;
 
+  /// Smoothed pill region averaged over recent frames (reduces jitter).
+  final Rect? smoothedPillRegion;
+
+  /// Last position where the pill was seen before disappearing.
+  final Rect? lastSeenPillRegion;
+
   PillOnTongueResult({
     required this.phase,
     this.face,
@@ -31,6 +38,8 @@ class PillOnTongueResult {
     this.totalMouthPixels = 0,
     required this.guidance,
     required this.timestamp,
+    this.smoothedPillRegion,
+    this.lastSeenPillRegion,
   });
 
   factory PillOnTongueResult.empty() => PillOnTongueResult(
@@ -63,6 +72,16 @@ class PillOnTongueService {
   int _consecutivePillFrames = 0;
   static const int _requiredStableFrames = 5;
 
+  // Position buffer: last 10 frames of detected pill regions
+  static const int _positionBufferSize = 10;
+  final List<Rect> _positionBuffer = [];
+
+  // Disappearance detection
+  static const int _disappearanceFrameThreshold = 3;
+  int _consecutiveAbsentFrames = 0;
+  bool _wasPillDetected = false;
+  Rect? _lastSeenPillRegion;
+
   PillOnTongueService() {
     _faceDetector = FaceDetector(
       options: FaceDetectorOptions(
@@ -83,13 +102,16 @@ class PillOnTongueService {
 
     if (faces.isEmpty) {
       _consecutivePillFrames = 0;
-      return PillOnTongueResult(
-        phase: DetectionPhase.noFace,
-        mouthOpenRatio: 0.0,
-        pillConfidence: 0.0,
-        guidance: 'Yüzünüzü kameraya gösterin',
-        timestamp: DateTime.now(),
-      );
+      _trackAbsence();
+      return _buildDisappearanceResultIfNeeded() ??
+          PillOnTongueResult(
+            phase: DetectionPhase.noFace,
+            mouthOpenRatio: 0.0,
+            pillConfidence: 0.0,
+            guidance: 'Yüzünüzü kameraya gösterin',
+            timestamp: DateTime.now(),
+            lastSeenPillRegion: _lastSeenPillRegion,
+          );
     }
 
     final face = faces.first;
@@ -100,14 +122,17 @@ class PillOnTongueService {
     if ((yaw != null && yaw.abs() > _maxFrontalAngle) ||
         (pitch != null && pitch.abs() > _maxFrontalAngle)) {
       _consecutivePillFrames = 0;
-      return PillOnTongueResult(
-        phase: DetectionPhase.faceDetected,
-        face: face,
-        mouthOpenRatio: 0.0,
-        pillConfidence: 0.0,
-        guidance: 'Lütfen yüzünüzü doğrudan kameraya çevirin',
-        timestamp: DateTime.now(),
-      );
+      _trackAbsence();
+      return _buildDisappearanceResultIfNeeded(face: face) ??
+          PillOnTongueResult(
+            phase: DetectionPhase.faceDetected,
+            face: face,
+            mouthOpenRatio: 0.0,
+            pillConfidence: 0.0,
+            guidance: 'Lütfen yüzünüzü doğrudan kameraya çevirin',
+            timestamp: DateTime.now(),
+            lastSeenPillRegion: _lastSeenPillRegion,
+          );
     }
 
     // Step 3: Check mouth open
@@ -115,27 +140,33 @@ class PillOnTongueService {
 
     if (mouthOpenRatio < _mouthOpenThreshold) {
       _consecutivePillFrames = 0;
-      return PillOnTongueResult(
-        phase: DetectionPhase.faceDetected,
-        face: face,
-        mouthOpenRatio: mouthOpenRatio,
-        pillConfidence: 0.0,
-        guidance: 'Ağzınızı açın ve hapı dilinizin üstüne koyun',
-        timestamp: DateTime.now(),
-      );
+      _trackAbsence();
+      return _buildDisappearanceResultIfNeeded(face: face, mouthOpenRatio: mouthOpenRatio) ??
+          PillOnTongueResult(
+            phase: DetectionPhase.faceDetected,
+            face: face,
+            mouthOpenRatio: mouthOpenRatio,
+            pillConfidence: 0.0,
+            guidance: 'Ağzınızı açın ve hapı dilinizin üstüne koyun',
+            timestamp: DateTime.now(),
+            lastSeenPillRegion: _lastSeenPillRegion,
+          );
     }
 
     // Step 4: Mouth is open — analyze mouth region for pill
     final mouthRect = _getMouthRegion(face);
     if (mouthRect == null) {
-      return PillOnTongueResult(
-        phase: DetectionPhase.mouthOpen,
-        face: face,
-        mouthOpenRatio: mouthOpenRatio,
-        pillConfidence: 0.0,
-        guidance: 'Ağzınız açık — hapı dilinize koyun',
-        timestamp: DateTime.now(),
-      );
+      _trackAbsence();
+      return _buildDisappearanceResultIfNeeded(face: face, mouthOpenRatio: mouthOpenRatio) ??
+          PillOnTongueResult(
+            phase: DetectionPhase.mouthOpen,
+            face: face,
+            mouthOpenRatio: mouthOpenRatio,
+            pillConfidence: 0.0,
+            guidance: 'Ağzınız açık — hapı dilinize koyun',
+            timestamp: DateTime.now(),
+            lastSeenPillRegion: _lastSeenPillRegion,
+          );
     }
 
     // Analyze NV21 pixels in mouth region
@@ -145,12 +176,21 @@ class PillOnTongueService {
       inputImage.metadata?.rotation,
     );
 
-    if (pillAnalysis.confidence >= _pillConfidenceThreshold) {
+    final pillDetectedThisFrame =
+        pillAnalysis.confidence >= _pillConfidenceThreshold;
+
+    if (pillDetectedThisFrame) {
       _consecutivePillFrames++;
+      _consecutiveAbsentFrames = 0;
+      _addToPositionBuffer(mouthRect);
+      _lastSeenPillRegion = mouthRect;
+      _wasPillDetected = true;
     } else {
       _consecutivePillFrames = max(0, _consecutivePillFrames - 1);
+      _trackAbsence();
     }
 
+    final smoothed = _smoothedPosition();
     final isStable = _consecutivePillFrames >= _requiredStableFrames;
 
     if (isStable) {
@@ -164,8 +204,18 @@ class PillOnTongueService {
         totalMouthPixels: pillAnalysis.totalPixels,
         guidance: 'Hap algılandı! ✓',
         timestamp: DateTime.now(),
+        smoothedPillRegion: smoothed,
+        lastSeenPillRegion: _lastSeenPillRegion,
       );
     }
+
+    // Check if pill just disappeared
+    final disappearanceResult = _buildDisappearanceResultIfNeeded(
+      face: face,
+      mouthOpenRatio: mouthOpenRatio,
+      mouthRegion: mouthRect,
+    );
+    if (disappearanceResult != null) return disappearanceResult;
 
     return PillOnTongueResult(
       phase: DetectionPhase.mouthOpen,
@@ -179,7 +229,66 @@ class PillOnTongueService {
           ? 'Hap algılanıyor... Sabit tutun ($_consecutivePillFrames/$_requiredStableFrames)'
           : 'Ağzınız açık — hapı dilinize koyun',
       timestamp: DateTime.now(),
+      smoothedPillRegion: smoothed,
+      lastSeenPillRegion: _lastSeenPillRegion,
     );
+  }
+
+  /// Track a frame where the pill was not detected.
+  void _trackAbsence() {
+    if (_wasPillDetected) {
+      _consecutiveAbsentFrames++;
+    }
+  }
+
+  /// If pill was previously detected and now absent for [_disappearanceFrameThreshold]
+  /// frames, return a [pillDisappeared] result. Otherwise null.
+  PillOnTongueResult? _buildDisappearanceResultIfNeeded({
+    Face? face,
+    double mouthOpenRatio = 0.0,
+    Rect? mouthRegion,
+  }) {
+    if (_wasPillDetected &&
+        _consecutiveAbsentFrames >= _disappearanceFrameThreshold) {
+      // Pill disappeared — record event and reset tracking
+      final lastPos = _lastSeenPillRegion;
+      _wasPillDetected = false;
+      _consecutiveAbsentFrames = 0;
+      _positionBuffer.clear();
+      return PillOnTongueResult(
+        phase: DetectionPhase.pillDisappeared,
+        face: face,
+        mouthOpenRatio: mouthOpenRatio,
+        mouthRegion: mouthRegion,
+        pillConfidence: 0.0,
+        guidance: 'Hap kayboldu — yutulmuş olabilir',
+        timestamp: DateTime.now(),
+        lastSeenPillRegion: lastPos,
+      );
+    }
+    return null;
+  }
+
+  /// Add a pill position to the ring buffer.
+  void _addToPositionBuffer(Rect position) {
+    _positionBuffer.add(position);
+    if (_positionBuffer.length > _positionBufferSize) {
+      _positionBuffer.removeAt(0);
+    }
+  }
+
+  /// Average the buffered positions for jitter smoothing.
+  Rect? _smoothedPosition() {
+    if (_positionBuffer.isEmpty) return null;
+    double l = 0, t = 0, r = 0, b = 0;
+    for (final rect in _positionBuffer) {
+      l += rect.left;
+      t += rect.top;
+      r += rect.right;
+      b += rect.bottom;
+    }
+    final n = _positionBuffer.length;
+    return Rect.fromLTRB(l / n, t / n, r / n, b / n);
   }
 
   /// Multi-point median mouth open ratio using inner lip contours.

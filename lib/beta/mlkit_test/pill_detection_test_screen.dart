@@ -13,6 +13,7 @@ class PillDetectionTestScreen extends StatefulWidget {
       _PillDetectionTestScreenState();
 }
 
+
 class _PillDetectionTestScreenState extends State<PillDetectionTestScreen> {
   CameraController? _cameraController;
   bool _isCameraInitialized = false;
@@ -190,6 +191,8 @@ class _PillDetectionTestScreenState extends State<PillDetectionTestScreen> {
         return Colors.blue;
       case DetectionPhase.pillDetected:
         return Colors.green;
+      case DetectionPhase.pillDisappeared:
+        return Colors.purple;
     }
   }
 
@@ -203,6 +206,8 @@ class _PillDetectionTestScreenState extends State<PillDetectionTestScreen> {
         return Icons.mood;
       case DetectionPhase.pillDetected:
         return Icons.check_circle;
+      case DetectionPhase.pillDisappeared:
+        return Icons.remove_circle_outline;
     }
   }
 
@@ -216,6 +221,8 @@ class _PillDetectionTestScreenState extends State<PillDetectionTestScreen> {
         return 'Ağız Açık';
       case DetectionPhase.pillDetected:
         return 'Hap Algılandı!';
+      case DetectionPhase.pillDisappeared:
+        return 'Hap Kayboldu';
     }
   }
 
@@ -327,7 +334,9 @@ class _PillDetectionTestScreenState extends State<PillDetectionTestScreen> {
                           _stepLine(phase.index >= 1),
                           _stepDot('Ağız', phase.index >= 2, Colors.blue),
                           _stepLine(phase.index >= 2),
-                          _stepDot('Hap', phase.index >= 3, Colors.green),
+                          _stepDot('Hap', phase == DetectionPhase.pillDetected || phase == DetectionPhase.pillDisappeared, Colors.green),
+                          _stepLine(phase == DetectionPhase.pillDisappeared),
+                          _stepDot('Yutuldu', phase == DetectionPhase.pillDisappeared, Colors.purple),
                         ],
                       ),
                       const SizedBox(height: 12),

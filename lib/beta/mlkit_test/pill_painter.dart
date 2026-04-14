@@ -32,8 +32,13 @@ class PillPainter extends CustomPainter {
     _drawLipContours(canvas, size, face);
 
     // Draw mouth region highlight if mouth is open
-    if (result.mouthRegion != null && result.phase.index >= 2) {
-      final mouthRect = _transformRect(result.mouthRegion!, size);
+    final showMouth = result.mouthRegion != null &&
+        (result.phase == DetectionPhase.mouthOpen ||
+            result.phase == DetectionPhase.pillDetected);
+    if (showMouth) {
+      // Use smoothed region for pill overlay to reduce jitter
+      final displayRect = result.smoothedPillRegion ?? result.mouthRegion!;
+      final mouthRect = _transformRect(displayRect, size);
 
       final mouthPaint = Paint()
         ..color = result.phase == DetectionPhase.pillDetected
@@ -74,6 +79,36 @@ class PillPainter extends CustomPainter {
       textPainter.paint(
         canvas,
         Offset(mouthRect.left, mouthRect.top - 18),
+      );
+    }
+
+    // Draw last-seen position when pill disappeared
+    if (result.phase == DetectionPhase.pillDisappeared &&
+        result.lastSeenPillRegion != null) {
+      final lastRect = _transformRect(result.lastSeenPillRegion!, size);
+
+      final dashedPaint = Paint()
+        ..color = Colors.purple.withValues(alpha: 0.5)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0;
+      canvas.drawRect(lastRect, dashedPaint);
+
+      final labelPainter = TextPainter(
+        text: const TextSpan(
+          text: ' PILL DISAPPEARED ',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 12,
+            fontWeight: FontWeight.bold,
+            backgroundColor: Colors.purple,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      labelPainter.paint(
+        canvas,
+        Offset(lastRect.left, lastRect.top - 18),
       );
     }
   }
@@ -164,6 +199,8 @@ class PillPainter extends CustomPainter {
         return Colors.blue;
       case DetectionPhase.pillDetected:
         return Colors.green;
+      case DetectionPhase.pillDisappeared:
+        return Colors.purple;
     }
   }
 
