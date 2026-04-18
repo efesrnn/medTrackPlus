@@ -175,6 +175,7 @@ class _MyAppState extends State<MyApp> {
       } catch (_) {}
       globalAlarmState.value = alarmSettings;
     });
+    NotificationService.setupNotificationListeners();
   }
 
   @override

@@ -117,6 +117,7 @@ export const onVerificationCreated = functions
           type: "verification",
           classification,
           macAddress,
+          verificationId: context.params.verificationId,
           section: section.toString(),
           hasDevice: hasDevice.toString(),
         },
