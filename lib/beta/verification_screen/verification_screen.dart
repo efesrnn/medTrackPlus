@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
@@ -10,7 +12,13 @@ import 'package:medTrackPlus/beta/enums/app_mode.dart';
 import 'package:medTrackPlus/beta/enums/verification_state.dart';
 import 'package:medTrackPlus/main.dart';
 import 'package:medTrackPlus/beta/models/cv_frame_data.dart';
+import 'package:medTrackPlus/beta/models/verification_result.dart' as vr;
 import 'package:medTrackPlus/beta/providers/mode_provider.dart';
+import 'package:medTrackPlus/beta/verification/accuracy_scoring_engine.dart';
+import 'package:medTrackPlus/beta/verification/cloud_verification_service.dart';
+import 'package:medTrackPlus/beta/camera_test/camera_stream_manager.dart';
+import 'package:medTrackPlus/beta/camera_test/video_clip_extractor.dart';
+import 'package:uuid/uuid.dart';
 
 class VerificationScreen extends StatefulWidget {
   /// If launched from alarm dismiss, pass the alarm's section index.
@@ -38,6 +46,12 @@ class _VerificationScreenState extends State<VerificationScreen>
   // ── Face detection ────────────────────────────────────────────────────────
   final FaceDetectionService _faceDetectionService = FaceDetectionService();
   FaceDetectionResult? _lastResult;
+
+  // ── Cloud & scoring services ────────────────────────────────────────────
+  final CloudVerificationService _cloudService = CloudVerificationService();
+  final AccuracyScoringEngine _scoringEngine = AccuracyScoringEngine();
+  final VideoClipExtractor _clipExtractor = VideoClipExtractor();
+  final VideoFrameBuffer _videoBuffer = VideoFrameBuffer();
 
   // ── Verification state machine ────────────────────────────────────────────
   VerificationState _verificationState = VerificationState.idle;
@@ -113,6 +127,17 @@ class _VerificationScreenState extends State<VerificationScreen>
     final inputImage = _buildInputImage(image);
     if (inputImage == null) return;
 
+    // Buffer raw Y-plane for VideoClipExtractor
+    if (_verificationState != VerificationState.idle &&
+        image.planes.isNotEmpty) {
+      _videoBuffer.add(BufferedFrame(
+        yPlane: Uint8List.fromList(image.planes[0].bytes),
+        width: image.width,
+        height: image.height,
+        timestamp: DateTime.now(),
+      ));
+    }
+
     final result = await _faceDetectionService.processImage(inputImage);
 
     // Collect lip contour points from all four contours.
@@ -131,7 +156,6 @@ class _VerificationScreenState extends State<VerificationScreen>
     }
 
     final frameData = CVFrameData(
-      // TODO: Replace mock pill detection with CVProcessor.processFrame()
       pillDetected: _mockPillDetected,
       pillConfidence: _mockPillDetected ? 0.85 : 0.0,
       pillBoundingBox: Rect.zero,
@@ -234,14 +258,94 @@ class _VerificationScreenState extends State<VerificationScreen>
     }
   }
 
-  void _finishScoring() {
+  Future<void> _finishScoring() async {
     _stopStreaming();
     _timeoutTimer?.cancel();
     _stateTimer?.cancel();
 
-    // TODO: Call IAccuracyScoringEngine.calculateScore(_capturedFrames)
-    // and ICloudVerificationService.save() here.
+    try {
+      // 1. Calculate accuracy score
+      final pillScore = _capturedFrames.where((f) => f.pillDetected).length /
+          (_capturedFrames.isEmpty ? 1 : _capturedFrames.length);
+      final mouthScore =
+          _capturedFrames.where((f) => f.isMouthOpen).length /
+              (_capturedFrames.isEmpty ? 1 : _capturedFrames.length);
+
+      final score = _scoringEngine.calculate(
+        mode: _appMode == AppMode.device
+            ? ScoringMode.withDevice
+            : ScoringMode.deviceFree,
+        pill: pillScore.clamp(0.0, 1.0),
+        lip: pillScore.clamp(0.0, 1.0),
+        mouth: mouthScore.clamp(0.0, 1.0),
+        timing: 0.8,
+      );
+
+      final classification = _scoringEngine.classify(score);
+
+      // 2. Extract clip if suspicious
+      String footageUrl = '';
+      final userId = FirebaseAuth.instance.currentUser?.uid;
+
+      if (userId != null &&
+          classification == VerificationResult.suspicious) {
+        final clipPath = await _clipExtractor.extractIfSuspicious(
+          classification: classification,
+          buffer: _videoBuffer,
+          criticalTimestamps: _capturedFrames
+              .where((f) => f.pillDetected)
+              .map((f) => f.timestamp)
+              .toList(),
+          criticalLabels: ['pill_detected', 'pill_consumed'],
+        );
+
+        if (clipPath != null) {
+          try {
+            footageUrl = await _cloudService.upload(userId, clipPath);
+          } catch (e) {
+            debugPrint('[VerificationScreen] Upload failed: $e');
+          }
+        }
+      }
+
+      // 3. Save verification result to Firestore
+      if (userId != null) {
+        final result = vr.VerificationResult(
+          id: const Uuid().v4(),
+          accuracyScore: score,
+          classification: _mapClassification(classification),
+          presenceDetected:
+              _capturedFrames.any((f) => f.faceDetected),
+          appMode: _appMode,
+          subScores: {
+            'pill': pillScore,
+            'mouth': mouthScore,
+            'timing': 0.8,
+          },
+          footageUrl: footageUrl,
+          sectionIndex: widget.sectionIndex,
+          timestamp: DateTime.now(),
+        );
+
+        await _cloudService.save(userId, result);
+      }
+    } catch (e) {
+      debugPrint('[VerificationScreen] Scoring/save error: $e');
+    }
+
     _transition(VerificationState.completed);
+  }
+
+  vr.VerificationClassification _mapClassification(
+      VerificationResult engineResult) {
+    switch (engineResult) {
+      case VerificationResult.rejected:
+        return vr.VerificationClassification.rejected;
+      case VerificationResult.suspicious:
+        return vr.VerificationClassification.suspicious;
+      case VerificationResult.success:
+        return vr.VerificationClassification.success;
+    }
   }
 
   void _startVerification() {

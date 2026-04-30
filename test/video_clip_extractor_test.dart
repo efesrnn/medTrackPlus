@@ -1,4 +1,4 @@
-vidimport 'dart:typed_data';
+import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:medTrackPlus/beta/camera_test/camera_stream_manager.dart';
 import 'package:medTrackPlus/beta/camera_test/video_clip_extractor.dart';

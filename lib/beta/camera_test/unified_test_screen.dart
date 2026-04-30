@@ -339,8 +339,8 @@ class _UnifiedTestScreenState extends ConsumerState<UnifiedTestScreen> {
                 icon: Icons.fiber_manual_record,
                 label: 'Kayıt',
                 color: Colors.red,
-                onPressed: () async {
-                  await ref.read(cameraProvider.notifier).stopStreaming();
+                onPressed: () {
+                  // startRecording internally stops streaming + adds delay
                   ref.read(cameraProvider.notifier).startRecording();
                 },
               ),
