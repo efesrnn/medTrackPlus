@@ -196,5 +196,7 @@
   "alarm_permission_desc": "İlaç saati geldiğinde alarmın tam vaktinde çalabilmesi için ayarlardan 'Alarmlar ve Hatırlatıcılar' iznini vermeniz gerekmektedir.",
   "fsi_permission_title": "Tam Ekran Bildirim İzni",
   "fsi_permission_desc": "Ekranınız kilitliyken bile alarm ekranının görünebilmesi için lütfen ayarlardan tam ekran bildirim iznini etkinleştirin.",
-  "open_settings": "Ayarları Aç"
+  "open_settings": "Ayarları Aç",
+  "dispense_tab": "Dağıtım",
+  "verification_tab": "Doğrulama"
 }

@@ -6,6 +6,7 @@ import 'package:medTrackPlus/beta/mlkit_test/pill_detection_test_screen.dart';
 import 'package:medTrackPlus/beta/mode_selection_screen.dart';
 import 'package:medTrackPlus/beta/verification_screen/verification_screen.dart';
 import 'package:medTrackPlus/app/relative_review_screen.dart';
+import 'package:medTrackPlus/app/reports_screen.dart';
 
 /// Represents a single beta screen entry.
 class BetaScreen {
@@ -71,6 +72,16 @@ class BetaRegistry {
       builder: (_) => const RelativeReviewScreen(
         macAddress: 'ABCDEF123456',
         verificationId: 'XayfII1aJPBK9jvpis9q',
+      ),
+    ),
+
+    // -- Doga: Reports --
+    BetaScreen(
+      name: 'Reports Screen',
+      description: 'Dispense + Verification stats with charts',
+      builder: (_) => const ReportsScreen(
+        macAddress: 'ABCDEF123456',
+        targetUserId: 'testuser123',
       ),
     ),
   ];
