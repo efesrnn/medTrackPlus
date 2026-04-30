@@ -5,6 +5,7 @@ import 'package:medTrackPlus/beta/mlkit_test/mlkit_test_screen.dart';
 import 'package:medTrackPlus/beta/mlkit_test/pill_detection_test_screen.dart';
 import 'package:medTrackPlus/beta/mode_selection_screen.dart';
 import 'package:medTrackPlus/beta/verification_screen/verification_screen.dart';
+import 'package:medTrackPlus/app/relative_review_screen.dart';
 
 /// Represents a single beta screen entry.
 class BetaScreen {
@@ -61,6 +62,16 @@ class BetaRegistry {
       name: 'Unified Detection Test',
       description: 'ML Kit detection + video recording + upload (birlesik)',
       builder: (_) => const UnifiedTestScreen(),
+    ),
+
+    // -- Doga: Review --
+    BetaScreen(
+      name: 'Relative Review Screen',
+      description: 'Verification review with video, scores & approve/deny',
+      builder: (_) => const RelativeReviewScreen(
+        macAddress: 'ABCDEF123456',
+        verificationId: 'XayfII1aJPBK9jvpis9q',
+      ),
     ),
   ];
 }
