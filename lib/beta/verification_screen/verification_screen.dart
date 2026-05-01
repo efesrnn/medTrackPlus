@@ -197,6 +197,7 @@ class _VerificationScreenState extends State<VerificationScreen>
     }
 
     final frameData = CVFrameData(
+      // TODO: Replace mock pill detection with CVProcessor.processFrame()
       pillDetected: _mockPillDetected,
       pillConfidence: _mockPillDetected ? 0.85 : 0.0,
       pillBoundingBox: Rect.zero,
