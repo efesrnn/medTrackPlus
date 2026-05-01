@@ -135,6 +135,9 @@ ios/.symlinks/
 .idea/usage.statistics.xml
 .idea/dictionaries
 .idea/shelf
+<<<<<<< HEAD
+>>>>>>> parent of 9c761ac (Remove machine-specific IDE files from tracking)
+=======
 >>>>>>> parent of 9c761ac (Remove machine-specific IDE files from tracking)
 
 # Windows
