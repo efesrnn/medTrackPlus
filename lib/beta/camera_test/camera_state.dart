@@ -105,6 +105,9 @@ class CameraNotifier extends StateNotifier<CameraState> {
 
   int _currentCameraIndex = 0;
 
+  /// Exposes the current state for non-notifier consumers.
+  CameraState get currentState => state;
+
   Future<void> initialize({int cameraIndex = 0}) async {
     state = const CameraInitializing();
     try {
@@ -118,8 +121,8 @@ class CameraNotifier extends StateNotifier<CameraState> {
       _controller = CameraController(
         cams[_currentCameraIndex],
         ResolutionPreset.medium,
-        enableAudio: true,
-        imageFormatGroup: ImageFormatGroup.yuv420,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.nv21,
       );
 
       await _controller!.initialize();
@@ -182,6 +185,9 @@ class CameraNotifier extends StateNotifier<CameraState> {
 
     if (state is CameraStreaming) {
       await stopStreaming();
+      // Camera2 pipeline needs time to drain after stopping image stream.
+      // Without this delay, startVideoRecording can hit "Connection timed out".
+      await Future.delayed(const Duration(milliseconds: 500));
     }
 
     try {
@@ -200,7 +206,20 @@ class CameraNotifier extends StateNotifier<CameraState> {
       state = CameraPreviewing(_controller!);
       return file.path;
     } catch (e) {
-      state = CameraError('Failed to stop recording: $e', CameraPreviewing(_controller!));
+      // Camera2 "waitUntilIdle" timeout — reinitialize to recover.
+      try {
+        await _controller!.dispose();
+        _controller = CameraController(
+          (await cameras)[_currentCameraIndex],
+          ResolutionPreset.medium,
+          enableAudio: false,
+          imageFormatGroup: ImageFormatGroup.nv21,
+        );
+        await _controller!.initialize();
+        state = CameraError('Recording timed out. Camera recovered.', CameraPreviewing(_controller!));
+      } catch (_) {
+        state = CameraError('Failed to stop recording: $e', const CameraIdle());
+      }
       return null;
     }
   }
