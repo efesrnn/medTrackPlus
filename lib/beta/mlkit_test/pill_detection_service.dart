@@ -1,13 +1,29 @@
 import 'dart:math';
 import 'dart:ui';
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:google_mlkit_image_labeling/google_mlkit_image_labeling.dart';
 
 enum DetectionPhase {
   noFace,
   faceDetected,
   mouthOpen,
-  pillDetected,
+  pillOnTongue,
+  mouthClosedWithPill,
+  drinking,
+  mouthReopened,
+  swallowConfirmed,
+  swallowFailed,
+  timeoutExpired,
+}
+
+enum _Stage {
+  awaitingPill,
+  awaitingDrink,
+  awaitingReopen,
+  verifyingSwallow,
+  done,
 }
 
 class PillOnTongueResult {
@@ -20,6 +36,9 @@ class PillOnTongueResult {
   final int totalMouthPixels;
   final String guidance;
   final DateTime timestamp;
+  final Rect? smoothedPillRegion;
+  final Rect? lastSeenPillRegion;
+  final String? detectedDrinkLabel;
 
   PillOnTongueResult({
     required this.phase,
@@ -31,6 +50,9 @@ class PillOnTongueResult {
     this.totalMouthPixels = 0,
     required this.guidance,
     required this.timestamp,
+    this.smoothedPillRegion,
+    this.lastSeenPillRegion,
+    this.detectedDrinkLabel,
   });
 
   factory PillOnTongueResult.empty() => PillOnTongueResult(
@@ -44,121 +66,443 @@ class PillOnTongueResult {
 
 class PillOnTongueService {
   late final FaceDetector _faceDetector;
+  late final ImageLabeler _imageLabeler;
 
-  // Mouth open threshold (ratio of lip distance / face height)
   static const double _mouthOpenThreshold = 0.08;
+  static const double _maxFrontalAngle = 25.0;
 
-  // Pill detection: minimum white-ish pixel ratio in mouth region
-  static const double _pillPixelThreshold = 0.05; // 5% of mouth area
+  static const double _pillPixelThreshold = 0.05;
   static const double _pillConfidenceThreshold = 0.4;
-
-  // NV21 Y channel thresholds for "white/light" pill pixels
-  // Pill on tongue: bright area (Y > threshold) against dark/pink mouth
   static const int _brightnessThreshold = 160;
 
-  // Stability
-  int _consecutivePillFrames = 0;
   static const int _requiredStableFrames = 5;
+  static const int _positionBufferSize = 10;
+
+  // Drink-related substrings (ML Kit default model labels, lowercased).
+  // Matched as substring so "Coffee cup", "Wine glass", "Drinkware" all hit.
+  static const List<String> _drinkLabelSubstrings = [
+    'drink', 'bottle', 'cup', 'mug', 'glass', 'water',
+    'beverage', 'liquid', 'juice', 'tableware', 'drinkware',
+    'tumbler', 'jar', 'pitcher', 'flask', 'thermos', 'kettle',
+  ];
+  static const double _drinkConfidenceThreshold = 0.40;
+  static const Duration _labelingInterval = Duration(milliseconds: 400);
+
+  // Timeouts after pill is confirmed in mouth
+  static const Duration _drinkWarningAfter = Duration(seconds: 30);
+  static const Duration _drinkTimeoutAfter = Duration(seconds: 60);
+
+  // Frames to wait when verifying swallow
+  static const int _swallowVerifyFrames = 8;
+
+  // How many drink-label hits required before confirming drink (≈ N * interval)
+  static const int _requiredDrinkHits = 3;
+
+  int _consecutivePillFrames = 0;
+  int _swallowVerifyCounter = 0;
+  bool _pillSeenInVerify = false;
+  int _drinkLabelHits = 0;
+
+  final List<Rect> _positionBuffer = [];
+  Rect? _lastSeenPillRegion;
+
+  _Stage _stage = _Stage.awaitingPill;
+  DateTime? _pillConfirmedAt;
+  DateTime _lastLabelingRun = DateTime.fromMillisecondsSinceEpoch(0);
+  String? _detectedDrinkLabel;
+  bool _isLabeling = false;
 
   PillOnTongueService() {
     _faceDetector = FaceDetector(
       options: FaceDetectorOptions(
         performanceMode: FaceDetectorMode.fast,
         enableContours: true,
+        enableClassification: true,
+        enableLandmarks: true,
       ),
     );
+    _imageLabeler = ImageLabeler(
+      options: ImageLabelerOptions(confidenceThreshold: 0.3),
+    );
+  }
+
+  /// Restart the workflow from the beginning.
+  void reset() {
+    _consecutivePillFrames = 0;
+    _swallowVerifyCounter = 0;
+    _pillSeenInVerify = false;
+    _drinkLabelHits = 0;
+    _positionBuffer.clear();
+    _lastSeenPillRegion = null;
+    _stage = _Stage.awaitingPill;
+    _pillConfirmedAt = null;
+    _detectedDrinkLabel = null;
   }
 
   Future<PillOnTongueResult> processFrame(
     CameraImage image,
     InputImage inputImage,
   ) async {
-    // Step 1: Detect face
     final faces = await _faceDetector.processImage(inputImage);
+    final now = DateTime.now();
 
     if (faces.isEmpty) {
       _consecutivePillFrames = 0;
-      return PillOnTongueResult(
+      return _emit(
         phase: DetectionPhase.noFace,
-        mouthOpenRatio: 0.0,
-        pillConfidence: 0.0,
         guidance: 'Yüzünüzü kameraya gösterin',
-        timestamp: DateTime.now(),
+        now: now,
       );
     }
 
     final face = faces.first;
-
-    // Step 2: Check mouth open
-    final mouthOpenRatio = _calculateMouthOpenRatio(face);
-
-    if (mouthOpenRatio < _mouthOpenThreshold) {
+    final yaw = face.headEulerAngleY;
+    final pitch = face.headEulerAngleX;
+    if ((yaw != null && yaw.abs() > _maxFrontalAngle) ||
+        (pitch != null && pitch.abs() > _maxFrontalAngle)) {
       _consecutivePillFrames = 0;
-      return PillOnTongueResult(
+      return _emit(
+        phase: DetectionPhase.faceDetected,
+        face: face,
+        guidance: 'Lütfen yüzünüzü doğrudan kameraya çevirin',
+        now: now,
+      );
+    }
+
+    final mouthOpenRatio = _calculateMouthOpenRatio(face);
+    final mouthOpen = mouthOpenRatio >= _mouthOpenThreshold;
+    final mouthRect = mouthOpen ? _getMouthRegion(face) : null;
+
+    _PillPixelAnalysis? pillAnalysis;
+    bool pillDetectedThisFrame = false;
+    if (mouthRect != null) {
+      pillAnalysis = _analyzeMouthRegion(image, mouthRect, inputImage.metadata?.rotation);
+      pillDetectedThisFrame = pillAnalysis.confidence >= _pillConfidenceThreshold;
+    }
+
+    switch (_stage) {
+      case _Stage.awaitingPill:
+        return _handleAwaitingPill(face, mouthOpenRatio, mouthRect,
+            pillAnalysis, pillDetectedThisFrame, now);
+      case _Stage.awaitingDrink:
+        return _handleAwaitingDrink(
+            face, mouthOpenRatio, mouthRect, inputImage, now);
+      case _Stage.awaitingReopen:
+        return _handleAwaitingReopen(
+            face, mouthOpenRatio, mouthRect, now);
+      case _Stage.verifyingSwallow:
+        return _handleVerifyingSwallow(face, mouthOpenRatio, mouthRect,
+            pillAnalysis, pillDetectedThisFrame, now);
+      case _Stage.done:
+        return _emit(
+          phase: _lastDonePhase,
+          face: face,
+          mouthOpenRatio: mouthOpenRatio,
+          guidance: _lastDoneGuidance,
+          now: now,
+        );
+    }
+  }
+
+  DetectionPhase _lastDonePhase = DetectionPhase.swallowConfirmed;
+  String _lastDoneGuidance = '';
+
+  PillOnTongueResult _handleAwaitingPill(
+    Face face,
+    double mouthOpenRatio,
+    Rect? mouthRect,
+    _PillPixelAnalysis? analysis,
+    bool pillDetected,
+    DateTime now,
+  ) {
+    if (mouthRect == null) {
+      _consecutivePillFrames = 0;
+      return _emit(
         phase: DetectionPhase.faceDetected,
         face: face,
         mouthOpenRatio: mouthOpenRatio,
-        pillConfidence: 0.0,
-        guidance: 'Ağzınızı açın ve hapı dilinizin üstüne koyun',
-        timestamp: DateTime.now(),
+        guidance: 'Adım 1: Ağzınızı açın',
+        now: now,
       );
     }
 
-    // Step 3: Mouth is open — analyze mouth region for pill
-    final mouthRect = _getMouthRegion(face);
-    if (mouthRect == null) {
-      return PillOnTongueResult(
-        phase: DetectionPhase.mouthOpen,
-        face: face,
-        mouthOpenRatio: mouthOpenRatio,
-        pillConfidence: 0.0,
-        guidance: 'Ağzınız açık — hapı dilinize koyun',
-        timestamp: DateTime.now(),
-      );
-    }
-
-    // Analyze NV21 pixels in mouth region
-    final pillAnalysis = _analyzeMouthRegion(
-      image,
-      mouthRect,
-      inputImage.metadata?.rotation,
-    );
-
-    if (pillAnalysis.confidence >= _pillConfidenceThreshold) {
+    if (pillDetected) {
       _consecutivePillFrames++;
+      _addToPositionBuffer(mouthRect);
+      _lastSeenPillRegion = mouthRect;
     } else {
       _consecutivePillFrames = max(0, _consecutivePillFrames - 1);
     }
 
-    final isStable = _consecutivePillFrames >= _requiredStableFrames;
+    final smoothed = _smoothedPosition();
+    final stable = _consecutivePillFrames >= _requiredStableFrames;
 
-    if (isStable) {
-      return PillOnTongueResult(
-        phase: DetectionPhase.pillDetected,
+    if (stable) {
+      _stage = _Stage.awaitingDrink;
+      _pillConfirmedAt = now;
+      return _emit(
+        phase: DetectionPhase.pillOnTongue,
         face: face,
         mouthOpenRatio: mouthOpenRatio,
         mouthRegion: mouthRect,
-        pillConfidence: pillAnalysis.confidence,
-        whitePixelCount: pillAnalysis.whitePixels,
-        totalMouthPixels: pillAnalysis.totalPixels,
-        guidance: 'Hap algılandı! ✓',
-        timestamp: DateTime.now(),
+        pillConfidence: analysis?.confidence ?? 0.0,
+        whitePixelCount: analysis?.whitePixels ?? 0,
+        totalMouthPixels: analysis?.totalPixels ?? 0,
+        guidance: 'Hap algılandı! Şimdi ağzınızı kapatın ve su için',
+        smoothedPillRegion: smoothed,
+        lastSeenPillRegion: _lastSeenPillRegion,
+        now: now,
       );
     }
 
-    return PillOnTongueResult(
+    return _emit(
       phase: DetectionPhase.mouthOpen,
       face: face,
       mouthOpenRatio: mouthOpenRatio,
       mouthRegion: mouthRect,
-      pillConfidence: pillAnalysis.confidence,
-      whitePixelCount: pillAnalysis.whitePixels,
-      totalMouthPixels: pillAnalysis.totalPixels,
+      pillConfidence: analysis?.confidence ?? 0.0,
+      whitePixelCount: analysis?.whitePixels ?? 0,
+      totalMouthPixels: analysis?.totalPixels ?? 0,
       guidance: _consecutivePillFrames > 0
           ? 'Hap algılanıyor... Sabit tutun ($_consecutivePillFrames/$_requiredStableFrames)'
-          : 'Ağzınız açık — hapı dilinize koyun',
-      timestamp: DateTime.now(),
+          : 'Adım 2: Hapı dilinizin üstüne koyun',
+      smoothedPillRegion: smoothed,
+      lastSeenPillRegion: _lastSeenPillRegion,
+      now: now,
     );
+  }
+
+  PillOnTongueResult _handleAwaitingDrink(
+    Face face,
+    double mouthOpenRatio,
+    Rect? mouthRect,
+    InputImage inputImage,
+    DateTime now,
+  ) {
+    final elapsed = now.difference(_pillConfirmedAt ?? now);
+
+    if (elapsed > _drinkTimeoutAfter) {
+      _stage = _Stage.done;
+      _lastDonePhase = DetectionPhase.timeoutExpired;
+      _lastDoneGuidance = 'Süre doldu — işlem iptal edildi';
+      return _emit(
+        phase: DetectionPhase.timeoutExpired,
+        face: face,
+        mouthOpenRatio: mouthOpenRatio,
+        guidance: _lastDoneGuidance,
+        lastSeenPillRegion: _lastSeenPillRegion,
+        now: now,
+      );
+    }
+
+    // Throttled image labeling
+    if (!_isLabeling &&
+        now.difference(_lastLabelingRun) >= _labelingInterval) {
+      _lastLabelingRun = now;
+      _isLabeling = true;
+      _imageLabeler.processImage(inputImage).then((labels) {
+        if (kDebugMode && labels.isNotEmpty) {
+          final top = labels.take(5).map((l) =>
+              '${l.label}(${(l.confidence * 100).toStringAsFixed(0)})').join(', ');
+          debugPrint('[PillDetection] labels: $top');
+        }
+        bool frameHasDrink = false;
+        for (final l in labels) {
+          if (l.confidence < _drinkConfidenceThreshold) continue;
+          final lower = l.label.toLowerCase();
+          if (_drinkLabelSubstrings.any((s) => lower.contains(s))) {
+            _detectedDrinkLabel = l.label;
+            frameHasDrink = true;
+            break;
+          }
+        }
+        if (frameHasDrink) {
+          _drinkLabelHits++;
+          if (_drinkLabelHits >= _requiredDrinkHits &&
+              _stage == _Stage.awaitingDrink) {
+            _stage = _Stage.awaitingReopen;
+          }
+        } else {
+          _drinkLabelHits = max(0, _drinkLabelHits - 1);
+        }
+      }).whenComplete(() => _isLabeling = false);
+    }
+
+    final String guidance;
+    if (_drinkLabelHits > 0) {
+      guidance = 'Bardak algılanıyor... '
+          'sabit tutun ($_drinkLabelHits/$_requiredDrinkHits)';
+    } else if (elapsed > _drinkWarningAfter) {
+      guidance = 'Lütfen su için '
+          '(kalan süre: ${(_drinkTimeoutAfter - elapsed).inSeconds}s)';
+    } else if (mouthOpenRatio >= _mouthOpenThreshold) {
+      guidance = 'Adım 3: Ağzınızı kapatın ve su için';
+    } else {
+      guidance = 'Adım 4: Bardak/şişe ile su için';
+    }
+
+    return _emit(
+      phase: DetectionPhase.mouthClosedWithPill,
+      face: face,
+      mouthOpenRatio: mouthOpenRatio,
+      mouthRegion: mouthRect,
+      guidance: guidance,
+      lastSeenPillRegion: _lastSeenPillRegion,
+      now: now,
+    );
+  }
+
+  PillOnTongueResult _handleAwaitingReopen(
+    Face face,
+    double mouthOpenRatio,
+    Rect? mouthRect,
+    DateTime now,
+  ) {
+    final mouthOpen = mouthOpenRatio >= _mouthOpenThreshold;
+    if (mouthOpen) {
+      _stage = _Stage.verifyingSwallow;
+      _swallowVerifyCounter = 0;
+      _pillSeenInVerify = false;
+      return _emit(
+        phase: DetectionPhase.mouthReopened,
+        face: face,
+        mouthOpenRatio: mouthOpenRatio,
+        mouthRegion: mouthRect,
+        guidance: 'Yutma kontrol ediliyor...',
+        lastSeenPillRegion: _lastSeenPillRegion,
+        now: now,
+      );
+    }
+
+    return _emit(
+      phase: DetectionPhase.drinking,
+      face: face,
+      mouthOpenRatio: mouthOpenRatio,
+      guidance: 'İçme algılandı (${_detectedDrinkLabel ?? "?"}) — '
+          'Adım 5: Yuttuktan sonra ağzınızı tekrar açın',
+      lastSeenPillRegion: _lastSeenPillRegion,
+      detectedDrinkLabel: _detectedDrinkLabel,
+      now: now,
+    );
+  }
+
+  PillOnTongueResult _handleVerifyingSwallow(
+    Face face,
+    double mouthOpenRatio,
+    Rect? mouthRect,
+    _PillPixelAnalysis? analysis,
+    bool pillDetected,
+    DateTime now,
+  ) {
+    if (mouthRect == null || mouthOpenRatio < _mouthOpenThreshold) {
+      // Mouth closed again — keep waiting until reopened
+      return _emit(
+        phase: DetectionPhase.mouthReopened,
+        face: face,
+        mouthOpenRatio: mouthOpenRatio,
+        guidance: 'Ağzınızı açık tutun (yutma kontrol ediliyor)',
+        lastSeenPillRegion: _lastSeenPillRegion,
+        now: now,
+      );
+    }
+
+    _swallowVerifyCounter++;
+    if (pillDetected) _pillSeenInVerify = true;
+
+    if (_swallowVerifyCounter >= _swallowVerifyFrames) {
+      if (_pillSeenInVerify) {
+        // Pill still in mouth — go back and re-check after next close+reopen
+        _stage = _Stage.awaitingReopen;
+        _swallowVerifyCounter = 0;
+        _pillSeenInVerify = false;
+        return _emit(
+          phase: DetectionPhase.swallowFailed,
+          face: face,
+          mouthOpenRatio: mouthOpenRatio,
+          mouthRegion: mouthRect,
+          pillConfidence: analysis?.confidence ?? 0.0,
+          guidance: 'Hap hâlâ ağzınızda — yutmaya çalışın, '
+              'sonra ağzınızı kapatıp tekrar açın',
+          lastSeenPillRegion: _lastSeenPillRegion,
+          now: now,
+        );
+      }
+      _stage = _Stage.done;
+      _lastDonePhase = DetectionPhase.swallowConfirmed;
+      _lastDoneGuidance = 'Hap yutuldu! ✓';
+      return _emit(
+        phase: _lastDonePhase,
+        face: face,
+        mouthOpenRatio: mouthOpenRatio,
+        mouthRegion: mouthRect,
+        pillConfidence: analysis?.confidence ?? 0.0,
+        guidance: _lastDoneGuidance,
+        lastSeenPillRegion: _lastSeenPillRegion,
+        now: now,
+      );
+    }
+
+    return _emit(
+      phase: DetectionPhase.mouthReopened,
+      face: face,
+      mouthOpenRatio: mouthOpenRatio,
+      mouthRegion: mouthRect,
+      pillConfidence: analysis?.confidence ?? 0.0,
+      guidance: 'Yutma kontrol ediliyor... '
+          '($_swallowVerifyCounter/$_swallowVerifyFrames)',
+      lastSeenPillRegion: _lastSeenPillRegion,
+      now: now,
+    );
+  }
+
+  PillOnTongueResult _emit({
+    required DetectionPhase phase,
+    Face? face,
+    double mouthOpenRatio = 0.0,
+    Rect? mouthRegion,
+    double pillConfidence = 0.0,
+    int whitePixelCount = 0,
+    int totalMouthPixels = 0,
+    required String guidance,
+    Rect? smoothedPillRegion,
+    Rect? lastSeenPillRegion,
+    String? detectedDrinkLabel,
+    required DateTime now,
+  }) {
+    return PillOnTongueResult(
+      phase: phase,
+      face: face,
+      mouthOpenRatio: mouthOpenRatio,
+      mouthRegion: mouthRegion,
+      pillConfidence: pillConfidence,
+      whitePixelCount: whitePixelCount,
+      totalMouthPixels: totalMouthPixels,
+      guidance: guidance,
+      timestamp: now,
+      smoothedPillRegion: smoothedPillRegion,
+      lastSeenPillRegion: lastSeenPillRegion,
+      detectedDrinkLabel: detectedDrinkLabel ?? _detectedDrinkLabel,
+    );
+  }
+
+  void _addToPositionBuffer(Rect position) {
+    _positionBuffer.add(position);
+    if (_positionBuffer.length > _positionBufferSize) {
+      _positionBuffer.removeAt(0);
+    }
+  }
+
+  Rect? _smoothedPosition() {
+    if (_positionBuffer.isEmpty) return null;
+    double l = 0, t = 0, r = 0, b = 0;
+    for (final rect in _positionBuffer) {
+      l += rect.left;
+      t += rect.top;
+      r += rect.right;
+      b += rect.bottom;
+    }
+    final n = _positionBuffer.length;
+    return Rect.fromLTRB(l / n, t / n, r / n, b / n);
   }
 
   double _calculateMouthOpenRatio(Face face) {
@@ -168,25 +512,28 @@ class PillOnTongueService {
     if (upperLipBottom == null || lowerLipTop == null) return 0.0;
     if (upperLipBottom.points.isEmpty || lowerLipTop.points.isEmpty) return 0.0;
 
-    // Calculate vertical distance between inner lips (mouth gap)
-    final upperCenter = _centerOf(upperLipBottom.points);
-    final lowerCenter = _centerOf(lowerLipTop.points);
-    final lipGap = (lowerCenter.dy - upperCenter.dy).abs();
-
     final faceHeight = face.boundingBox.height;
     if (faceHeight <= 0) return 0.0;
 
-    return lipGap / faceHeight;
-  }
+    final upperSorted = List<Point<int>>.from(upperLipBottom.points)
+      ..sort((a, b) => a.x.compareTo(b.x));
+    final lowerSorted = List<Point<int>>.from(lowerLipTop.points)
+      ..sort((a, b) => a.x.compareTo(b.x));
 
-  Offset _centerOf(List<Point<int>> points) {
-    if (points.isEmpty) return Offset.zero;
-    double sx = 0, sy = 0;
-    for (final p in points) {
-      sx += p.x;
-      sy += p.y;
+    final sampleCount = min(upperSorted.length, lowerSorted.length);
+    if (sampleCount == 0) return 0.0;
+
+    final gaps = <double>[];
+    for (int i = 0; i < sampleCount; i++) {
+      final uIdx = (i * (upperSorted.length - 1)) ~/ max(1, sampleCount - 1);
+      final lIdx = (i * (lowerSorted.length - 1)) ~/ max(1, sampleCount - 1);
+      final gap = (lowerSorted[lIdx].y - upperSorted[uIdx].y).abs().toDouble();
+      gaps.add(gap);
     }
-    return Offset(sx / points.length, sy / points.length);
+
+    gaps.sort();
+    final medianGap = gaps[gaps.length ~/ 2];
+    return medianGap / faceHeight;
   }
 
   Rect? _getMouthRegion(Face face) {
@@ -196,7 +543,6 @@ class PillOnTongueService {
     if (upperLipTop == null || lowerLipBottom == null) return null;
     if (upperLipTop.points.isEmpty || lowerLipBottom.points.isEmpty) return null;
 
-    // Build bounding rect from all lip contour points
     double minX = double.infinity, minY = double.infinity;
     double maxX = double.negativeInfinity, maxY = double.negativeInfinity;
 
@@ -207,7 +553,6 @@ class PillOnTongueService {
       maxY = max(maxY, p.y.toDouble());
     }
 
-    // Shrink slightly to focus on inner mouth
     final w = maxX - minX;
     final h = maxY - minY;
     final insetX = w * 0.15;
@@ -226,7 +571,6 @@ class PillOnTongueService {
     Rect mouthRect,
     InputImageRotation? rotation,
   ) {
-    // NV21: first plane is Y (brightness), second plane is VU (interleaved)
     if (image.planes.isEmpty) {
       return _PillPixelAnalysis(0, 0, 0.0);
     }
@@ -236,7 +580,6 @@ class PillOnTongueService {
     final imgH = image.height;
     final bytesPerRow = image.planes.first.bytesPerRow;
 
-    // Clamp mouth rect to image bounds
     final left = mouthRect.left.toInt().clamp(0, imgW - 1);
     final top = mouthRect.top.toInt().clamp(0, imgH - 1);
     final right = mouthRect.right.toInt().clamp(0, imgW - 1);
@@ -249,7 +592,6 @@ class PillOnTongueService {
     int whitePixels = 0;
     int totalPixels = 0;
 
-    // Sample every 2nd pixel for performance
     for (int y = top; y < bottom; y += 2) {
       for (int x = left; x < right; x += 2) {
         final idx = y * bytesPerRow + x;
@@ -268,16 +610,11 @@ class PillOnTongueService {
     }
 
     final ratio = whitePixels / totalPixels;
-
-    // Confidence: higher when ratio is in sweet spot (5-40%)
-    // Too low = no pill, too high = probably teeth or overexposure
     double confidence;
     if (ratio >= _pillPixelThreshold && ratio <= 0.45) {
-      // Normalize to 0-1 range within sweet spot
       confidence = ((ratio - _pillPixelThreshold) / (0.30 - _pillPixelThreshold))
           .clamp(0.0, 1.0);
     } else if (ratio > 0.45) {
-      // Likely teeth or light — reduce confidence
       confidence = 0.2;
     } else {
       confidence = 0.0;
@@ -288,6 +625,7 @@ class PillOnTongueService {
 
   Future<void> dispose() async {
     await _faceDetector.close();
+    await _imageLabeler.close();
   }
 }
 

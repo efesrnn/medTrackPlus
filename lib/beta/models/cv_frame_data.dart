@@ -20,6 +20,14 @@ class CVFrameData {
   /// Bounding box of the detected face in image coordinates.
   final Rect faceBoundingBox;
 
+  /// Head pose euler angles in degrees (null when unavailable).
+  final double? headYaw;
+  final double? headPitch;
+  final double? headRoll;
+
+  /// Whether the face is frontal enough for reliable detection.
+  final bool isFaceFrontal;
+
   final DateTime timestamp;
 
   const CVFrameData({
@@ -30,6 +38,10 @@ class CVFrameData {
     required this.lipContour,
     required this.mouthOpenRatio,
     required this.faceBoundingBox,
+    this.headYaw,
+    this.headPitch,
+    this.headRoll,
+    this.isFaceFrontal = true,
     required this.timestamp,
   });
 
