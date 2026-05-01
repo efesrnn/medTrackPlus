@@ -7,6 +7,8 @@ import 'package:firebase_messaging/firebase_messaging.dart' hide NotificationSet
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:medTrackPlus/app/relative_review_screen.dart';
+import 'package:medTrackPlus/main.dart';
 
 class NotificationService {
   static const String _alarmsEnabledKey = 'alarms_enabled';
@@ -69,9 +71,41 @@ class NotificationService {
           notificationLayout: NotificationLayout.Default,
           category: NotificationCategory.Reminder,
           icon: 'resource://drawable/notification_bar_icon',
+          payload: {
+            'type': data['type'] ?? '',
+            'macAddress': data['macAddress'] ?? '',
+            'verificationId': data['verificationId'] ?? '',
+          },
         ),
       );
     });
+  }
+
+  /// Bildirime tıklandığında navigasyon
+  static void setupNotificationListeners() {
+    // FCM: Uygulama arka plandayken bildirime tıklanınca
+    FirebaseMessaging.onMessageOpenedApp.listen(_handleNotificationNavigation);
+
+    // FCM: Uygulama kapalıyken bildirime tıklanınca
+    FirebaseMessaging.instance.getInitialMessage().then((message) {
+      if (message != null) _handleNotificationNavigation(message);
+    });
+  }
+
+  static void _handleNotificationNavigation(RemoteMessage message) {
+    final data = message.data;
+    if (data['type'] == 'verification' &&
+        data['macAddress'] != null &&
+        data['verificationId'] != null) {
+      navigatorKey.currentState?.push(
+        MaterialPageRoute(
+          builder: (_) => RelativeReviewScreen(
+            macAddress: data['macAddress']!,
+            verificationId: data['verificationId']!,
+          ),
+        ),
+      );
+    }
   }
 
   // --- BAŞLATMA ---

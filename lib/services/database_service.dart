@@ -26,11 +26,14 @@ class DatabaseService {
     String email = _sanitize(rawEmail);
 
     try {
+      final sw = Stopwatch()..start();
       var results = await Future.wait([
         _firestore.collection('dispenser').where('owner_mail', isEqualTo: email).get(),
         _firestore.collection('dispenser').where('secondary_mails', arrayContains: email).get(),
         _firestore.collection('dispenser').where('read_only_mails', arrayContains: email).get(),
       ]);
+      sw.stop();
+      print('>>> getAllUserDevices: ${sw.elapsedMilliseconds}ms');
 
       Set<String> addedMacs = {};
 
@@ -60,9 +63,17 @@ class DatabaseService {
     final String email = _sanitize(rawEmail);
 
     try {
-      final ownerQuery = await _firestore.collection('dispenser').where('owner_mail', isEqualTo: email).get();
-      final secondaryQuery = await _firestore.collection('dispenser').where('secondary_mails', arrayContains: email).get();
-      final readOnlyQuery = await _firestore.collection('dispenser').where('read_only_mails', arrayContains: email).get();
+      final sw = Stopwatch()..start();
+      final results = await Future.wait([
+        _firestore.collection('dispenser').where('owner_mail', isEqualTo: email).get(),
+        _firestore.collection('dispenser').where('secondary_mails', arrayContains: email).get(),
+        _firestore.collection('dispenser').where('read_only_mails', arrayContains: email).get(),
+      ]);
+      final ownerQuery = results[0];
+      final secondaryQuery = results[1];
+      final readOnlyQuery = results[2];
+      sw.stop();
+      print('>>> updateUserDeviceList: ${sw.elapsedMilliseconds}ms');
 
       final Set<String> ownedIds = ownerQuery.docs.map((d) => d.id).toSet();
       final Set<String> secondaryIds = secondaryQuery.docs.map((d) => d.id).toSet();
@@ -124,11 +135,14 @@ class DatabaseService {
       print("Güvenli İade Kontrolü Başlıyor... (Cihaz: $macAddress, Bölme: $sectionIndex)");
 
       // 1. KONTROL: Sistem zaten iade yapmış mı?
+      final sw = Stopwatch()..start();
       final refundCheck = await _firestore.collection('dispenser').doc(macAddress).collection('logs')
           .where('type', isEqualTo: 'system_refund')
           .where('section', isEqualTo: sectionIndex)
           .where('timestamp', isGreaterThan: fiveMinutesAgo)
           .get();
+      sw.stop();
+      print('>>> safeRefundPill query: ${sw.elapsedMilliseconds}ms');
 
       if (refundCheck.docs.isNotEmpty) {
         print("!!! GÜVENLİK KİLİDİ DEVREDE !!!");
@@ -204,11 +218,14 @@ class DatabaseService {
       final now = DateTime.now();
       final startOfWeek = now.subtract(const Duration(days: 7));
 
+      final sw = Stopwatch()..start();
       final query = await _firestore.collection('dispenser').doc(macAddress).collection('logs')
           .where('userId', isEqualTo: targetUserId)
           .where('timestamp', isGreaterThan: startOfWeek)
           .orderBy('timestamp', descending: true)
           .get();
+      sw.stop();
+      print('>>> getDispenseStats: ${sw.elapsedMilliseconds}ms');
 
       int total = 0; int success = 0; int failed = 0;
       Map<int, int> weeklySuccessMap = {1:0, 2:0, 3:0, 4:0, 5:0, 6:0, 7:0};
@@ -248,6 +265,92 @@ class DatabaseService {
     } catch (e) {
       print("Stats Error: $e");
       return {'total': 0, 'success': 0, 'failed': 0, 'weeklyData': {}, 'sectionStats': {}};
+    }
+  }
+
+  // --- VERIFICATION İSTATİSTİKLERİ ---
+
+  Future<Map<String, dynamic>> getVerificationStats(String macAddress, {DateTime? startDate, DateTime? endDate}) async {
+    try {
+      final now = DateTime.now();
+      final start = startDate ?? now.subtract(const Duration(days: 7));
+      final end = endDate ?? now;
+
+      // Firestore: detaylı verification geçmişi
+      final startStr = start.toUtc().toIso8601String();
+      final endStr = end.toUtc().toIso8601String();
+      final allDocs = await _firestore
+          .collection('dispenser').doc(macAddress)
+          .collection('verifications')
+          .get();
+      final query = allDocs.docs.where((doc) {
+        final ts = doc.data()['timestamp']?.toString() ?? '';
+        return ts.compareTo(startStr) >= 0 && ts.compareTo(endStr) <= 0;
+      }).toList();
+
+      int total = 0, successCount = 0, suspiciousCount = 0, rejectedCount = 0;
+      double totalScore = 0;
+      Map<String, Map<String, dynamic>> sectionBreakdown = {};
+
+      for (var doc in query) {
+        final data = doc.data();
+        total++;
+
+        final classification = data['classification'] ?? 'unknown';
+        final score = (data['accuracyScore'] ?? 0).toDouble();
+        final section = (data['sectionIndex'] ?? data['section'] ?? 0).toString();
+
+        totalScore += score;
+
+        if (classification == 'success') successCount++;
+        else if (classification == 'suspicious') suspiciousCount++;
+        else if (classification == 'rejected') rejectedCount++;
+
+        if (!sectionBreakdown.containsKey(section)) {
+          sectionBreakdown[section] = {
+            'total': 0, 'success': 0, 'suspicious': 0, 'rejected': 0, 'totalScore': 0.0,
+          };
+        }
+        sectionBreakdown[section]!['total'] = (sectionBreakdown[section]!['total'] as int) + 1;
+        sectionBreakdown[section]![classification] = ((sectionBreakdown[section]![classification] ?? 0) as int) + 1;
+        sectionBreakdown[section]!['totalScore'] = (sectionBreakdown[section]!['totalScore'] as double) + score;
+      }
+
+      // Section bazlı ortalama hesapla
+      for (var section in sectionBreakdown.keys) {
+        final s = sectionBreakdown[section]!;
+        final sTotal = s['total'] as int;
+        s['avgScore'] = sTotal > 0 ? (s['totalScore'] as double) / sTotal : 0.0;
+        s.remove('totalScore');
+      }
+
+      // RTDB: son verification (permission hatası olursa null döner)
+      Map<String, dynamic>? lastVerification;
+      try {
+        lastVerification = await getLastVerification(macAddress);
+      } catch (_) {}
+
+      return {
+        'total': total,
+        'success': successCount,
+        'suspicious': suspiciousCount,
+        'rejected': rejectedCount,
+        'successRate': total > 0 ? successCount / total : 0.0,
+        'suspiciousRate': total > 0 ? suspiciousCount / total : 0.0,
+        'rejectedRate': total > 0 ? rejectedCount / total : 0.0,
+        'avgScore': total > 0 ? totalScore / total : 0.0,
+        'sectionBreakdown': sectionBreakdown,
+        'lastVerification': lastVerification,
+        'source': 'firestore+rtdb',
+      };
+    } catch (e) {
+      print("Verification Stats Error: $e");
+      return {
+        'total': 0, 'success': 0, 'suspicious': 0, 'rejected': 0,
+        'successRate': 0.0, 'suspiciousRate': 0.0, 'rejectedRate': 0.0,
+        'avgScore': 0.0, 'sectionBreakdown': {}, 'lastVerification': null,
+        'source': 'error',
+      };
     }
   }
 
@@ -570,6 +673,7 @@ class DatabaseService {
     Set<String> relativeEmails = {};
     String myEmail = _sanitize(currentUserEmail);
     try {
+      final sw = Stopwatch()..start();
       DocumentSnapshot userDoc = await _firestore.collection('users').doc(uid).get();
       if (!userDoc.exists) return [];
       Map<String, dynamic> userData = userDoc.data() as Map<String, dynamic>;
@@ -579,41 +683,47 @@ class DatabaseService {
       allDeviceIds.addAll(userData['read_only_dispensers'] ?? []);
       if (allDeviceIds.isEmpty) return [];
 
-      for (var deviceId in allDeviceIds) {
-        try {
-          DocumentSnapshot deviceDoc = await _firestore.collection('dispenser').doc(deviceId).get();
-          if (deviceDoc.exists) {
-            Map<String, dynamic> data = deviceDoc.data() as Map<String, dynamic>;
-            if (data['owner_mail'] != null) relativeEmails.add(_sanitize(data['owner_mail'].toString()));
-            if (data['secondary_mails'] != null) { for (var m in data['secondary_mails']) relativeEmails.add(_sanitize(m.toString())); }
-            if (data['read_only_mails'] != null) { for (var m in data['read_only_mails']) relativeEmails.add(_sanitize(m.toString())); }
-          }
-        } catch (e) { print("Cihaz ($deviceId) okunurken hata: $e"); }
+      final deviceDocs = await Future.wait(
+        allDeviceIds.map((deviceId) => _firestore.collection('dispenser').doc(deviceId).get()),
+      );
+      for (var deviceDoc in deviceDocs) {
+        if (deviceDoc.exists) {
+          Map<String, dynamic> data = deviceDoc.data() as Map<String, dynamic>;
+          if (data['owner_mail'] != null) relativeEmails.add(_sanitize(data['owner_mail'].toString()));
+          if (data['secondary_mails'] != null) { for (var m in data['secondary_mails']) relativeEmails.add(_sanitize(m.toString())); }
+          if (data['read_only_mails'] != null) { for (var m in data['read_only_mails']) relativeEmails.add(_sanitize(m.toString())); }
+        }
       }
       relativeEmails.remove(myEmail);
       if (relativeEmails.isEmpty) return [];
 
+      final profileResults = await Future.wait(
+        relativeEmails.map((email) => _firestore.collection('users').where('email', isEqualTo: email).limit(1).get()),
+      );
+
       List<Map<String, dynamic>> relativesProfiles = [];
+      int i = 0;
       for (var email in relativeEmails) {
         String displayName = '';
         String photoURL = '';
         bool isRegistered = false;
-        try {
-          QuerySnapshot query = await _firestore.collection('users').where('email', isEqualTo: email).limit(1).get();
-          if (query.docs.isNotEmpty) {
-            var profile = query.docs.first.data() as Map<String, dynamic>;
-            displayName = profile['displayName'] ?? '';
-            photoURL = profile['photoURL'] ?? '';
-            isRegistered = true;
-          }
-        } catch (e) { print("Profil detayı çekilemedi ($email): $e"); }
+        final query = profileResults[i];
+        if (query.docs.isNotEmpty) {
+          var profile = query.docs.first.data() as Map<String, dynamic>;
+          displayName = profile['displayName'] ?? '';
+          photoURL = profile['photoURL'] ?? '';
+          isRegistered = true;
+        }
         relativesProfiles.add({
           'email': email,
           'displayName': displayName,
           'photoURL': photoURL,
           'isRegistered': isRegistered,
         });
+        i++;
       }
+      sw.stop();
+      print('>>> getRelativesInfo: ${sw.elapsedMilliseconds}ms');
       return relativesProfiles;
     } catch (e) { print("Genel getRelativesInfo hatası: $e"); return []; }
   }

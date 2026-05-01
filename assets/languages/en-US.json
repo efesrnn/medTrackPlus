@@ -196,5 +196,7 @@
   "alarm_permission_desc": "To ring the alarm exactly at the medication time, please allow 'Alarms & Reminders' in settings.",
   "fsi_permission_title": "Full Screen Notifications",
   "fsi_permission_desc": "To show the alarm screen even when your screen is locked, please enable full-screen intent permission in settings.",
-  "open_settings": "Open Settings"
+  "open_settings": "Open Settings",
+  "dispense_tab": "Dispense",
+  "verification_tab": "Verification"
 }
