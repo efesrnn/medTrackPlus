@@ -112,6 +112,7 @@ ios/Runner/GoogleService-Info.plist
 **/xcuserdata/
 
 # IDE - Android Studio / IntelliJ
+<<<<<<< HEAD
 .idea/
 
 # Claude Code
@@ -128,6 +129,13 @@ android/.gradle/
 # iOS
 ios/Pods/
 ios/.symlinks/
+=======
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/dictionaries
+.idea/shelf
+>>>>>>> parent of 9c761ac (Remove machine-specific IDE files from tracking)
 
 # Windows
 **/windows/flutter/generated_plugin_registrant.cc
