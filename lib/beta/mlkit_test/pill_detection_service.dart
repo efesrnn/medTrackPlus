@@ -68,14 +68,14 @@ class PillOnTongueService {
   late final FaceDetector _faceDetector;
   late final ImageLabeler _imageLabeler;
 
-  static const double _mouthOpenThreshold = 0.08;
-  static const double _maxFrontalAngle = 25.0;
+  static const double _mouthOpenThreshold = 0.06;
+  static const double _maxFrontalAngle = 30.0;
 
-  static const double _pillPixelThreshold = 0.05;
-  static const double _pillConfidenceThreshold = 0.4;
-  static const int _brightnessThreshold = 160;
+  static const double _pillPixelThreshold = 0.03;
+  static const double _pillConfidenceThreshold = 0.25;
+  static const int _brightnessThreshold = 140;
 
-  static const int _requiredStableFrames = 5;
+  static const int _requiredStableFrames = 3;
   static const int _positionBufferSize = 10;
 
   // Drink-related substrings (ML Kit default model labels, lowercased).
@@ -580,10 +580,41 @@ class PillOnTongueService {
     final imgH = image.height;
     final bytesPerRow = image.planes.first.bytesPerRow;
 
-    final left = mouthRect.left.toInt().clamp(0, imgW - 1);
-    final top = mouthRect.top.toInt().clamp(0, imgH - 1);
-    final right = mouthRect.right.toInt().clamp(0, imgW - 1);
-    final bottom = mouthRect.bottom.toInt().clamp(0, imgH - 1);
+    // ML Kit face contour points are in ROTATED (upright) coords, but the
+    // Y-plane bytes are in raw SENSOR (buffer) coords. We must inverse-rotate
+    // the rect so brightness analysis hits the actual mouth, not the side.
+    int leftRaw, topRaw, rightRaw, bottomRaw;
+    switch (rotation) {
+      case InputImageRotation.rotation90deg:
+        leftRaw = mouthRect.top.toInt();
+        topRaw = (imgH - mouthRect.right).toInt();
+        rightRaw = mouthRect.bottom.toInt();
+        bottomRaw = (imgH - mouthRect.left).toInt();
+        break;
+      case InputImageRotation.rotation270deg:
+        leftRaw = (imgW - mouthRect.bottom).toInt();
+        topRaw = mouthRect.left.toInt();
+        rightRaw = (imgW - mouthRect.top).toInt();
+        bottomRaw = mouthRect.right.toInt();
+        break;
+      case InputImageRotation.rotation180deg:
+        leftRaw = (imgW - mouthRect.right).toInt();
+        topRaw = (imgH - mouthRect.bottom).toInt();
+        rightRaw = (imgW - mouthRect.left).toInt();
+        bottomRaw = (imgH - mouthRect.top).toInt();
+        break;
+      case InputImageRotation.rotation0deg:
+      case null:
+        leftRaw = mouthRect.left.toInt();
+        topRaw = mouthRect.top.toInt();
+        rightRaw = mouthRect.right.toInt();
+        bottomRaw = mouthRect.bottom.toInt();
+        break;
+    }
+    final left = leftRaw.clamp(0, imgW - 1);
+    final top = topRaw.clamp(0, imgH - 1);
+    final right = rightRaw.clamp(0, imgW - 1);
+    final bottom = bottomRaw.clamp(0, imgH - 1);
 
     if (right <= left || bottom <= top) {
       return _PillPixelAnalysis(0, 0, 0.0);
@@ -611,11 +642,11 @@ class PillOnTongueService {
 
     final ratio = whitePixels / totalPixels;
     double confidence;
-    if (ratio >= _pillPixelThreshold && ratio <= 0.45) {
-      confidence = ((ratio - _pillPixelThreshold) / (0.30 - _pillPixelThreshold))
+    if (ratio >= _pillPixelThreshold && ratio <= 0.55) {
+      confidence = ((ratio - _pillPixelThreshold) / (0.12 - _pillPixelThreshold))
           .clamp(0.0, 1.0);
-    } else if (ratio > 0.45) {
-      confidence = 0.2;
+    } else if (ratio > 0.55) {
+      confidence = 0.35;
     } else {
       confidence = 0.0;
     }

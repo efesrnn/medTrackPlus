@@ -319,3 +319,80 @@ async function cleanupInvalidTokens(
 
   functions.logger.info(`Cleaned up ${invalidTokens.length} invalid FCM tokens.`);
 }
+
+/**
+ * Scheduled cleanup: every hour, list all objects under videos/ in the default
+ * Storage bucket and delete any that are older than 24 hours.
+ *
+ * Files are considered expired based on either:
+ *   - customMetadata.expiresAt (set by the client at upload time), or
+ *   - timeCreated (fallback, file age >= 24h).
+ */
+export const cleanupOldVideos = functions
+  .region("europe-west1")
+  .pubsub.schedule("every 1 hours")
+  .timeZone("UTC")
+  .onRun(async () => {
+    const bucket = admin.storage().bucket();
+    const [files] = await bucket.getFiles({prefix: "videos/"});
+
+    const now = Date.now();
+    const ttlMs = 24 * 60 * 60 * 1000;
+    let deleted = 0;
+    let kept = 0;
+
+    for (const file of files) {
+      try {
+        const [metadata] = await file.getMetadata();
+        const expiresAt = metadata.metadata?.expiresAt as string | undefined;
+        const createdAt = metadata.timeCreated;
+
+        let expired = false;
+        if (expiresAt) {
+          const exp = Date.parse(expiresAt);
+          if (!Number.isNaN(exp) && now > exp) expired = true;
+        } else if (createdAt) {
+          const created = Date.parse(createdAt);
+          if (!Number.isNaN(created) && now - created > ttlMs) expired = true;
+        }
+
+        if (expired) {
+          await file.delete();
+          deleted++;
+          functions.logger.info(`Deleted expired video: ${file.name}`);
+        } else {
+          kept++;
+        }
+      } catch (e) {
+        functions.logger.error(
+          `Failed to process ${file.name} during cleanup`,
+          e
+        );
+      }
+    }
+
+    functions.logger.info(
+      `cleanupOldVideos done. deleted=${deleted}, kept=${kept}`
+    );
+    return null;
+  });
+
+/**
+ * Storage trigger: when a video is uploaded under videos/{deviceId}/...,
+ * stamp a Firestore record so the relative review screen can find it even
+ * without a paired verification doc (e.g. orphaned uploads). Optional —
+ * primary metadata is written by the Flutter client.
+ */
+export const onVideoUploaded = functions
+  .region("europe-west1")
+  .storage.object()
+  .onFinalize(async (object) => {
+    if (!object.name || !object.name.startsWith("videos/")) return null;
+    const parts = object.name.split("/");
+    if (parts.length < 3) return null;
+    const deviceId = parts[1];
+    functions.logger.info(
+      `Video uploaded: ${object.name} (deviceId=${deviceId}, size=${object.size})`
+    );
+    return null;
+  });

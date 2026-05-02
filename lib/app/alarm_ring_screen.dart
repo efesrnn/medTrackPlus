@@ -3,7 +3,6 @@ import 'dart:io';
 import 'dart:ui';
 
 import 'package:alarm/alarm.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:easy_localization/easy_localization.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -11,7 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:medTrackPlus/main.dart';
 import 'package:medTrackPlus/services/database_service.dart';
-import 'package:medTrackPlus/services/auth_service.dart';
+import 'package:medTrackPlus/beta/verification_screen/verification_screen.dart';
 
 class AlarmRingScreen extends StatefulWidget {
   final AlarmSettings alarmSettings;
@@ -23,21 +22,18 @@ class AlarmRingScreen extends StatefulWidget {
 
 class _AlarmRingScreenState extends State<AlarmRingScreen> {
   static const platform = MethodChannel('com.example.medTrackPlus/lock_control');
+  // ignore: unused_field
   final DatabaseService _dbService = DatabaseService();
 
   static const Color colTurquoise = Color(0xFF36C0A6);
   static const Color colSkyBlue = Color(0xFF1D8AD6);
   static const Color colDeepSea = Color(0xFF0F5191);
 
-  bool _feedbackEnabled = true;
-  bool _showingFeedback = false;
   bool _processing = false;
 
   String _macAddress = "";
   List<int> _sectionIndices = [];
   List<String> _medicineNames = [];
-
-  int _currentFeedbackIndex = 0;
 
   @override
   void initState() {
@@ -46,17 +42,7 @@ class _AlarmRingScreenState extends State<AlarmRingScreen> {
     // ✅ Sadece native kanaldan kilit ekranı açma - Wakelock KALDIRILDI
     platform.invokeMethod('showOnLockScreen');
 
-    _checkSettings();
     _loadMetadata();
-  }
-
-  Future<void> _checkSettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (mounted) {
-      setState(() {
-        _feedbackEnabled = prefs.getBool('feedback_enabled') ?? true;
-      });
-    }
   }
 
   Future<void> _loadMetadata() async {
@@ -88,64 +74,43 @@ class _AlarmRingScreenState extends State<AlarmRingScreen> {
   }
 
   Future<void> _handleStop() async {
-    await Alarm.stop(widget.alarmSettings.id);
-
-    if (_feedbackEnabled && _macAddress.isNotEmpty && _medicineNames.isNotEmpty) {
-      setState(() {
-        _showingFeedback = true;
-      });
-    } else {
-      _closeApp();
-    }
-  }
-
-  Future<void> _processSingleFeedback(bool dropped) async {
     if (_processing) return;
     setState(() => _processing = true);
+    await Alarm.stop(widget.alarmSettings.id);
 
-    try {
-      int currentSection = _sectionIndices[_currentFeedbackIndex];
+    if (_macAddress.isNotEmpty && _sectionIndices.isNotEmpty) {
+      // Stop → directly run unified video verification for each medicine
+      // section. The verification screen itself records the outcome
+      // (cloud save + relative review feed). No legacy "did it drop?" UI.
+      await _runVerificationForAllSections();
+    }
 
-      final user = await AuthService().getOrCreateUser();
-      String uid = user?.uid ?? "unknown_user";
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('alarm_meta_${widget.alarmSettings.id}');
 
-      if (!dropped) {
-        await _dbService.safeRefundPill(_macAddress, currentSection, uid);
+    if (!mounted) return;
+    _closeApp();
+  }
 
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text("Stok durumu kontrol edildi ve düzeltildi."),
-              duration: Duration(seconds: 2),
+  /// Sequentially launches the unified VerificationScreen for each medicine
+  /// section in this alarm. The user can close any of them early; we just
+  /// move on to the next.
+  Future<void> _runVerificationForAllSections() async {
+    for (int i = 0; i < _sectionIndices.length; i++) {
+      if (!mounted) return;
+      try {
+        await Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => VerificationScreen(
+              sectionIndex: _sectionIndices[i],
+              macAddress: _macAddress,
             ),
-          );
-        }
+          ),
+        );
+      } catch (e) {
+        debugPrint('[AlarmRingScreen] Verification screen error: $e');
+        // Continue to next section regardless of failures
       }
-
-      await _dbService.logDispenseStatus(
-        macAddress: _macAddress,
-        sectionIndex: currentSection,
-        successful: dropped,
-        userResponse: dropped ? "Yes" : "No",
-        userId: uid,
-      );
-
-      if (_currentFeedbackIndex < _medicineNames.length - 1) {
-        setState(() {
-          _currentFeedbackIndex++;
-          _processing = false;
-        });
-      } else {
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.remove('alarm_meta_${widget.alarmSettings.id}');
-
-        await Future.delayed(const Duration(milliseconds: 300));
-        _closeApp();
-      }
-
-    } catch (e) {
-      debugPrint("Feedback işleme hatası: $e");
-      _closeApp();
     }
   }
 
@@ -171,99 +136,7 @@ class _AlarmRingScreenState extends State<AlarmRingScreen> {
       canPop: false,
       child: Scaffold(
         backgroundColor: colDeepSea,
-        body: _showingFeedback ? _buildFeedbackUI() : _buildAlarmUI(),
-      ),
-    );
-  }
-
-  Widget _buildFeedbackUI() {
-    String currentMedName = _medicineNames.isNotEmpty
-        ? _medicineNames[_currentFeedbackIndex]
-        : "İlaç";
-
-    return Container(
-      width: double.infinity, height: double.infinity,
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [colDeepSea, Color(0xFF15202B)]
-        ),
-      ),
-      child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 30.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              if(_medicineNames.length > 1)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 20.0),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: List.generate(_medicineNames.length, (index) {
-                      return Container(
-                        width: 10, height: 10,
-                        margin: const EdgeInsets.symmetric(horizontal: 4),
-                        decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: index == _currentFeedbackIndex ? colTurquoise : Colors.white24
-                        ),
-                      );
-                    }),
-                  ),
-                ),
-
-              const Icon(Icons.help_outline_rounded, color: Colors.white, size: 80),
-              const SizedBox(height: 30),
-
-              Text(
-                "$currentMedName düştü mü?",
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold, decoration: TextDecoration.none),
-              ),
-              const SizedBox(height: 15),
-
-              Text(
-                  "Lütfen ilacı alıp almadığınızı onaylayın.",
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white70, fontSize: 16, decoration: TextDecoration.none)
-              ),
-              const SizedBox(height: 60),
-
-              if (_processing)
-                const CircularProgressIndicator(color: Colors.white)
-              else
-                Row(
-                  children: [
-                    Expanded(
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.redAccent.withOpacity(0.9),
-                            padding: const EdgeInsets.symmetric(vertical: 20),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
-                        ),
-                        onPressed: () => _processSingleFeedback(false),
-                        child: const Text("HAYIR", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
-                      ),
-                    ),
-                    const SizedBox(width: 20),
-                    Expanded(
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                            backgroundColor: colTurquoise,
-                            padding: const EdgeInsets.symmetric(vertical: 20),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
-                        ),
-                        onPressed: () => _processSingleFeedback(true),
-                        child: const Text("EVET", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
-                      ),
-                    ),
-                  ],
-                )
-            ],
-          ),
-        ),
+        body: _buildAlarmUI(),
       ),
     );
   }

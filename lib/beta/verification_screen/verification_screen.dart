@@ -1,385 +1,512 @@
 import 'dart:async';
-import 'dart:typed_data';
+import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
-import 'package:medTrackPlus/beta/mlkit_test/face_detection_service.dart';
-import 'package:medTrackPlus/beta/mlkit_test/face_painter.dart';
 import 'package:medTrackPlus/beta/enums/app_mode.dart';
-import 'package:medTrackPlus/beta/enums/verification_state.dart';
-import 'package:medTrackPlus/main.dart';
-import 'package:medTrackPlus/beta/models/cv_frame_data.dart';
+import 'package:medTrackPlus/beta/mlkit_test/pill_detection_service.dart';
+import 'package:medTrackPlus/beta/mlkit_test/pill_painter.dart';
 import 'package:medTrackPlus/beta/models/verification_result.dart' as vr;
 import 'package:medTrackPlus/beta/providers/mode_provider.dart';
 import 'package:medTrackPlus/beta/verification/accuracy_scoring_engine.dart';
 import 'package:medTrackPlus/beta/verification/cloud_verification_service.dart';
-import 'package:medTrackPlus/beta/camera_test/camera_stream_manager.dart';
-import 'package:medTrackPlus/beta/camera_test/video_clip_extractor.dart';
+import 'package:medTrackPlus/main.dart' show AppColors;
+import 'package:medTrackPlus/services/consent_service.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:uuid/uuid.dart';
+import 'package:video_compress/video_compress.dart';
 
+/// Unified medication verification screen.
 class VerificationScreen extends StatefulWidget {
-  /// If launched from alarm dismiss, pass the alarm's section index.
   final int sectionIndex;
   final AppMode? modeOverride;
-
+  final String? macAddress;
   const VerificationScreen({
     super.key,
     this.sectionIndex = 0,
     this.modeOverride,
+    this.macAddress,
   });
-
   @override
   State<VerificationScreen> createState() => _VerificationScreenState();
 }
 
-class _VerificationScreenState extends State<VerificationScreen>
-    with WidgetsBindingObserver {
-  // ── Camera ────────────────────────────────────────────────────────────────
+class _VerificationScreenState extends State<VerificationScreen> {
   CameraController? _controller;
-  bool _isCameraReady = false;
-  bool _isFrontCamera = false;
-  bool _torchOn = false;
-  bool _isProcessingFrame = false;
-  Size _imageSize = const Size(480, 640);
+  bool _isCameraInitialized = false;
+  bool _isFrontCamera = true;
   InputImageRotation _rotation = InputImageRotation.rotation0deg;
+  bool _torchOn = false;
 
-  // ── Face detection ────────────────────────────────────────────────────────
-  final FaceDetectionService _faceDetectionService = FaceDetectionService();
-  FaceDetectionResult? _lastResult;
+  final PillOnTongueService _service = PillOnTongueService();
+  PillOnTongueResult _lastResult = PillOnTongueResult.empty();
+  Size _imageSize = const Size(480, 640);
+  bool _isProcessing = false;
+  /// Wall-clock timestamp of the last frame we processed. Used to detect when
+  /// the camera plugin pauses the image stream during recording so we can
+  /// hide the (now stale) PillPainter overlay.
+  DateTime? _lastFrameTime;
 
-  // ── Cloud & scoring services ────────────────────────────────────────────
+  int _frameCount = 0;
+  int _facePresentFrames = 0;
+  int _mouthOpenFrames = 0;
+  int _pillOnTongueFrames = 0;
+  DetectionPhase _highestPhaseReached = DetectionPhase.noFace;
+
+  bool _consentEnabled = false;
+  bool _recording = false;
+  String? _recordedLocalPath;
+  Timer? _recordingTimeoutTimer;
+  DateTime? _recordingStartedAt;
+  static const Duration _recordingMaxDuration = Duration(seconds: 15);
+
+  bool _uploading = false;
+  double _uploadProgress = 0.0;
+  String _uploadStatus = '';
+
+  final String _sessionId = const Uuid().v4();
+  bool _videoUploaded = false;
+  bool _completed = false;
+  String? _statusMessage;
+
   final CloudVerificationService _cloudService = CloudVerificationService();
   final AccuracyScoringEngine _scoringEngine = AccuracyScoringEngine();
-  final VideoClipExtractor _clipExtractor = VideoClipExtractor();
-  final VideoFrameBuffer _videoBuffer = VideoFrameBuffer();
-
-  // ── Verification state machine ────────────────────────────────────────────
-  VerificationState _verificationState = VerificationState.idle;
-  final List<CVFrameData> _capturedFrames = [];
-  Timer? _timeoutTimer;
-  Timer? _stateTimer;
-
-  // ── Pill detection placeholder ────────────────────────────────────────────
-  // TODO: Replace with real CVProcessor once pill detection model is ready.
-  bool _mockPillDetected = false;
 
   AppMode get _appMode => widget.modeOverride ?? modeProvider.value;
+  String get _deviceId =>
+      widget.macAddress ??
+      FirebaseAuth.instance.currentUser?.uid ??
+      'unknown_device';
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _initCamera();
+    _bootstrap();
   }
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (_controller == null || !_controller!.value.isInitialized) return;
-    if (state == AppLifecycleState.inactive) {
-      _stopStreaming();
-    } else if (state == AppLifecycleState.resumed) {
-      _initCamera();
+  Future<void> _bootstrap() async {
+    _consentEnabled = await ConsentService.isVideoConsentEnabled();
+    final status = await Permission.camera.request();
+    if (!status.isGranted) {
+      if (mounted) setState(() => _lastResult = PillOnTongueResult.empty());
+      return;
     }
+    await _initCamera();
   }
 
   Future<void> _initCamera() async {
     try {
       final cameras = await availableCameras();
-      if (cameras.isEmpty) {
-        debugPrint('[VerificationScreen] No cameras found');
-        return;
-      }
-
-      // Try front camera first, then back camera as fallback
-      final front = cameras.where(
-        (c) => c.lensDirection == CameraLensDirection.front,
-      );
-      final back = cameras.where(
-        (c) => c.lensDirection == CameraLensDirection.back,
-      );
-
-      // Order: front cameras first, then back, then any remaining
-      final orderedCameras = [...front, ...back, ...cameras]
-          .toSet()
-          .toList();
-
-      for (final camera in orderedCameras) {
+      if (cameras.isEmpty) return;
+      final front =
+          cameras.where((c) => c.lensDirection == CameraLensDirection.front);
+      final ordered = [...front, ...cameras].toSet().toList();
+      for (final camera in ordered) {
         try {
-          debugPrint('[VerificationScreen] Trying camera: ${camera.name}, lens: ${camera.lensDirection}');
           final controller = CameraController(
             camera,
             ResolutionPreset.medium,
             enableAudio: false,
             imageFormatGroup: ImageFormatGroup.nv21,
           );
-
-          await controller.initialize().timeout(
-            const Duration(seconds: 10),
-            onTimeout: () {
-              throw Exception('Camera initialize timeout');
-            },
-          );
+          await controller.initialize().timeout(const Duration(seconds: 10));
           if (!mounted) {
-            controller.dispose();
+            await controller.dispose();
             return;
           }
-
           _controller = controller;
           _isFrontCamera = camera.lensDirection == CameraLensDirection.front;
           _rotation = InputImageRotationValue.fromRawValue(
-                camera.sensorOrientation,
-              ) ??
+                  camera.sensorOrientation) ??
               InputImageRotation.rotation0deg;
-          setState(() => _isCameraReady = true);
-          _startStreaming();
-          return; // Success — stop trying
+          if (mounted) setState(() => _isCameraInitialized = true);
+          await _controller!.startImageStream(_onFrame);
+          return;
         } catch (e) {
           debugPrint('[VerificationScreen] Camera ${camera.name} failed: $e');
         }
       }
-
-      debugPrint('[VerificationScreen] All cameras failed to initialize');
     } catch (e) {
       debugPrint('[VerificationScreen] Camera init error: $e');
     }
   }
 
-  void _startStreaming() {
-    _controller?.startImageStream((CameraImage image) async {
-      if (_isProcessingFrame || _verificationState.isTerminal) return;
-      _isProcessingFrame = true;
-      try {
-        await _processFrame(image);
-      } finally {
-        _isProcessingFrame = false;
+  Future<void> _onFrame(CameraImage image) async {
+    if (_isProcessing || _completed) return;
+    _isProcessing = true;
+    try {
+      final inputImage = _buildInputImage(image);
+      if (inputImage == null) return;
+      final result = await _service.processFrame(image, inputImage);
+      _frameCount++;
+      _lastFrameTime = DateTime.now();
+      if (result.face != null) _facePresentFrames++;
+      switch (result.phase) {
+        case DetectionPhase.mouthOpen:
+        case DetectionPhase.pillOnTongue:
+        case DetectionPhase.mouthClosedWithPill:
+        case DetectionPhase.drinking:
+        case DetectionPhase.mouthReopened:
+          _mouthOpenFrames++;
+          break;
+        default:
+          break;
       }
-    });
-  }
-
-  void _stopStreaming() {
-    _controller?.stopImageStream().catchError((_) {});
-  }
-
-  Future<void> _processFrame(CameraImage image) async {
-    _imageSize = Size(image.width.toDouble(), image.height.toDouble());
-    final inputImage = _buildInputImage(image);
-    if (inputImage == null) return;
-
-    // Buffer raw Y-plane for VideoClipExtractor
-    if (_verificationState != VerificationState.idle &&
-        image.planes.isNotEmpty) {
-      _videoBuffer.add(BufferedFrame(
-        yPlane: Uint8List.fromList(image.planes[0].bytes),
-        width: image.width,
-        height: image.height,
-        timestamp: DateTime.now(),
-      ));
-    }
-
-    final result = await _faceDetectionService.processImage(inputImage);
-
-    // Collect lip contour points from all four contours.
-    final lipContour = <Offset>[];
-    for (final contour in [
-      result.upperLipTop,
-      result.upperLipBottom,
-      result.lowerLipTop,
-      result.lowerLipBottom,
-    ]) {
-      if (contour != null) {
-        lipContour.addAll(
-          contour.points.map((p) => Offset(p.x.toDouble(), p.y.toDouble())),
-        );
+      if (result.phase == DetectionPhase.pillOnTongue ||
+          result.phase == DetectionPhase.mouthClosedWithPill) {
+        _pillOnTongueFrames++;
       }
-    }
-
-    final frameData = CVFrameData(
-      // TODO: Replace mock pill detection with CVProcessor.processFrame()
-      pillDetected: _mockPillDetected,
-      pillConfidence: _mockPillDetected ? 0.85 : 0.0,
-      pillBoundingBox: Rect.zero,
-      faceDetected: result.faceDetected,
-      lipContour: lipContour,
-      mouthOpenRatio: result.mouthOpenRatio,
-      faceBoundingBox: result.face?.boundingBox ?? Rect.zero,
-      headYaw: result.headYaw,
-      headPitch: result.headPitch,
-      headRoll: result.headRoll,
-      isFaceFrontal: result.isFaceFrontal,
-      timestamp: DateTime.now(),
-    );
-
-    if (_verificationState != VerificationState.idle) {
-      _capturedFrames.add(frameData);
-    }
-
-    if (mounted) {
-      setState(() => _lastResult = result);
-      _advanceStateMachine(frameData);
+      if (result.phase.index > _highestPhaseReached.index) {
+        _highestPhaseReached = result.phase;
+      }
+      // Trigger recording only AFTER the pill is confirmed on the tongue —
+      // this guarantees the recording captures a meaningful moment (pill
+      // placement → mouth close → drink → swallow), not just an empty
+      // open mouth.
+      if (!_recording &&
+          !_videoUploaded &&
+          _consentEnabled &&
+          result.phase == DetectionPhase.pillOnTongue) {
+        _startRecording();
+      }
+      if (result.phase == DetectionPhase.swallowConfirmed && !_completed) {
+        _finalizeSuccess();
+      }
+      if (mounted) {
+        setState(() {
+          _lastResult = result;
+          _imageSize = Size(image.width.toDouble(), image.height.toDouble());
+        });
+      }
+    } catch (e) {
+      debugPrint('[VerificationScreen] Detection error: $e');
+    } finally {
+      _isProcessing = false;
     }
   }
 
   InputImage? _buildInputImage(CameraImage image) {
-    final camera = _controller?.description;
-    if (camera == null) return null;
-
-    final rotation = InputImageRotationValue.fromRawValue(
-          camera.sensorOrientation,
-        ) ??
-        InputImageRotation.rotation0deg;
-
+    final controller = _controller;
+    if (controller == null) return null;
     if (image.format.group != ImageFormatGroup.nv21) return null;
-    final plane = image.planes.first;
-
+    if (image.planes.isEmpty) return null;
     return InputImage.fromBytes(
-      bytes: plane.bytes,
+      bytes: image.planes.first.bytes,
       metadata: InputImageMetadata(
         size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
+        rotation: _rotation,
         format: InputImageFormat.nv21,
-        bytesPerRow: plane.bytesPerRow,
+        bytesPerRow: image.planes.first.bytesPerRow,
       ),
     );
   }
 
-  // ── State machine ─────────────────────────────────────────────────────────
-
-  void _advanceStateMachine(CVFrameData frame) {
-    switch (_verificationState) {
-      case VerificationState.waitingForPill:
-        if (frame.pillDetected) _transition(VerificationState.pillDetected);
-        break;
-
-      case VerificationState.pillDetected:
-        // Pill moves toward lip → approximate by checking face + pill proximity.
-        // TODO: Replace with real spatial tracking once pill detection is ready.
-        if (frame.pillDetected && frame.faceDetected) {
-          _transition(VerificationState.trackingToLip);
-        }
-        break;
-
-      case VerificationState.trackingToLip:
-        if (!frame.pillDetected) {
-          // Pill disappeared near mouth — assume consumed.
-          _transition(VerificationState.pillConsumed);
-        }
-        break;
-
-      case VerificationState.pillConsumed:
-        _transition(VerificationState.mouthCheckPrompt);
-        break;
-
-      case VerificationState.mouthCheckPrompt:
-        if (frame.isMouthOpen) _transition(VerificationState.mouthVerified);
-        break;
-
-      case VerificationState.mouthVerified:
-        _transition(VerificationState.scoring);
-        break;
-
-      case VerificationState.scoring:
-        _finishScoring();
-        break;
-
-      default:
-        break;
+  // Concurrent strategy: image stream and video recording run in parallel.
+  // Modern Android phones deliver frames at reduced rate during recording so
+  // detection keeps progressing. If a device pauses the stream, the staleness
+  // detector below hides the frozen overlay and the post-recording grace
+  // period in _onTimeout gives detection a chance to catch up.
+  Future<void> _startRecording() async {
+    if (_recording || _videoUploaded || _controller == null) return;
+    if (_controller!.value.isRecordingVideo) return;
+    try {
+      // Concurrent mode: do NOT stop the image stream. Modern Android phones
+      // (S20+, S22, S23 etc.) deliver frames at reduced rate during recording,
+      // which keeps detection alive. On devices that pause the stream the
+      // staleness detector below hides the (frozen) painter, so the user
+      // doesn't see misleading overlays.
+      await _controller!.startVideoRecording();
+      if (!mounted) return;
+      setState(() {
+        _recording = true;
+        _recordingStartedAt = DateTime.now();
+        _statusMessage = 'Kayıt başladı — hapı yutun ve su için';
+      });
+      _recordingTimeoutTimer?.cancel();
+      _recordingTimeoutTimer = Timer(_recordingMaxDuration, _onTimeout);
+    } catch (e) {
+      debugPrint('[VerificationScreen] startRecording failed: $e');
+      if (mounted) setState(() => _recording = false);
     }
   }
 
-  void _transition(VerificationState next) {
-    if (_verificationState == next) return;
-    setState(() => _verificationState = next);
+  Future<String?> _stopRecording() async {
+    if (!_recording || _controller == null) return null;
+    if (!_controller!.value.isRecordingVideo) return null;
+    try {
+      final XFile file = await _controller!.stopVideoRecording();
+      _recordingTimeoutTimer?.cancel();
+      _recordedLocalPath = file.path;
+      if (mounted) setState(() => _recording = false);
+      // If the camera plugin paused the stream during recording (some devices
+      // do), restart it so swallow detection can finish post-recording.
+      await _resumeImageStreamIfNeeded();
+      return file.path;
+    } catch (e) {
+      debugPrint('[VerificationScreen] stopRecording failed: $e');
+      if (mounted) setState(() => _recording = false);
+      await _resumeImageStreamIfNeeded();
+      return null;
+    }
+  }
 
-    if (next == VerificationState.mouthCheckPrompt) {
-      // Give user 10 s to open mouth.
-      _stateTimer?.cancel();
-      _stateTimer = Timer(const Duration(seconds: 10), () {
-        if (_verificationState == VerificationState.mouthCheckPrompt) {
-          _transition(VerificationState.timeout);
-        }
+  Future<void> _resumeImageStreamIfNeeded() async {
+    final c = _controller;
+    if (c == null) return;
+    if (c.value.isRecordingVideo) return;
+    if (c.value.isStreamingImages) return;
+    if (_completed) return;
+    try {
+      await c.startImageStream(_onFrame);
+    } catch (e) {
+      debugPrint('[VerificationScreen] resume stream failed: $e');
+    }
+  }
+
+  Future<void> _discardLocalRecording() async {
+    final path = _recordedLocalPath;
+    _recordedLocalPath = null;
+    if (path == null) return;
+    try {
+      final f = File(path);
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
+  }
+
+  Future<void> _toggleTorch() async {
+    final c = _controller;
+    if (c == null) return;
+    _torchOn = !_torchOn;
+    try {
+      await c.setFlashMode(_torchOn ? FlashMode.torch : FlashMode.off);
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
+  Future<void> _finalizeSuccess() async {
+    if (_completed) return;
+    _completed = true;
+    if (mounted) setState(() => _statusMessage = 'Yutma onaylandı.');
+    final localPath = await _stopRecording();
+    await _saveAndUpload(
+      localPath: localPath,
+      userConfirmed: true,
+      detectionConfirmed: true,
+    );
+    if (mounted) setState(() => _statusMessage = 'Doğrulama başarılı.');
+  }
+
+  Future<void> _onTimeout() async {
+    if (_completed) return;
+    if (mounted) setState(() => _statusMessage = 'Kayıt bitti — yutma doğrulanıyor...');
+    await _stopRecording();
+    if (!mounted) return;
+    // Grace period: give the resumed detection up to 10 seconds to catch
+    // DetectionPhase.swallowConfirmed before falling back to the user dialog.
+    final graceUntil = DateTime.now().add(const Duration(seconds: 10));
+    while (mounted && !_completed && DateTime.now().isBefore(graceUntil)) {
+      if (_lastResult.phase == DetectionPhase.swallowConfirmed) {
+        // _finalizeSuccess will be called from _onFrame
+        return;
+      }
+      await Future.delayed(const Duration(milliseconds: 250));
+    }
+    if (!mounted || _completed) return;
+    if (mounted) setState(() => _statusMessage = 'Otomatik doğrulanamadı.');
+    final tookIt = await _showTimeoutDialog();
+    if (!mounted) return;
+    if (tookIt == true) {
+      _completed = true;
+      await _saveAndUpload(
+        localPath: _recordedLocalPath,
+        userConfirmed: true,
+        detectionConfirmed: false,
+      );
+      if (mounted) setState(() => _statusMessage = 'Onayınız kaydedildi.');
+    } else {
+      await _discardLocalRecording();
+      _resetForRetry();
+    }
+  }
+
+  Future<bool?> _showTimeoutDialog() {
+    return showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: const [
+            Icon(Icons.timer_off_rounded, color: Colors.orange),
+            SizedBox(width: 8),
+            Text('Süre Doldu'),
+          ],
+        ),
+        content: const Text(
+          '30 saniye içinde yutma tespit edilemedi. '
+          'İlacı aldığınızı onaylıyor musunuz?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Hayır, içemedim'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.skyBlue,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Evet, içtim'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _resetForRetry() {
+    _frameCount = 0;
+    _facePresentFrames = 0;
+    _mouthOpenFrames = 0;
+    _pillOnTongueFrames = 0;
+    _highestPhaseReached = DetectionPhase.noFace;
+    _service.reset();
+    if (mounted) setState(() => _statusMessage = 'Tekrar deneyin.');
+  }
+
+  Future<String> _compressVideo(String sourcePath) async {
+    if (mounted) {
+      setState(() {
+        _uploading = true;
+        _uploadProgress = 0.0;
+        _uploadStatus = 'Video sıkıştırılıyor...';
+      });
+    }
+    try {
+      final sub = VideoCompress.compressProgress$.subscribe((p) {
+        if (!mounted) return;
+        setState(() => _uploadProgress = (p / 100.0 * 0.5).clamp(0.0, 0.5));
+      });
+      final info = await VideoCompress.compressVideo(
+        sourcePath,
+        quality: VideoQuality.LowQuality,
+        deleteOrigin: false,
+        includeAudio: false,
+      );
+      sub.unsubscribe();
+      final compressedPath = info?.path;
+      if (compressedPath == null || compressedPath.isEmpty) return sourcePath;
+      try {
+        final f = File(sourcePath);
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+      return compressedPath;
+    } catch (e) {
+      debugPrint('[VerificationScreen] Compression failed: $e');
+      return sourcePath;
+    }
+  }
+
+  Future<void> _saveAndUpload({
+    required String? localPath,
+    required bool userConfirmed,
+    required bool detectionConfirmed,
+  }) async {
+    final score = _computeScore(detectionConfirmed: detectionConfirmed);
+    final classification = _scoringEngine.classify(score);
+    String footageUrl = '';
+    String? storagePath;
+    if (_consentEnabled && localPath != null && !_videoUploaded) {
+      final pathToUpload = await _compressVideo(localPath);
+      if (mounted) setState(() => _uploadStatus = 'Sunucuya yükleniyor...');
+      try {
+        final upload = await _cloudService.uploadVideo(
+          deviceId: _deviceId,
+          localPath: pathToUpload,
+          onProgress: (p) {
+            if (!mounted) return;
+            setState(() =>
+                _uploadProgress = (0.5 + p * 0.5).clamp(0.0, 1.0));
+          },
+        );
+        footageUrl = upload.downloadUrl;
+        storagePath = upload.storagePath;
+        _videoUploaded = true;
+      } catch (e) {
+        debugPrint('[VerificationScreen] Upload failed: $e');
+        if (mounted) setState(() => _uploadStatus = 'Yükleme başarısız.');
+      } finally {
+        try {
+          final f = File(pathToUpload);
+          if (await f.exists()) await f.delete();
+        } catch (_) {}
+      }
+    }
+    if (mounted && _consentEnabled && localPath != null) {
+      setState(() => _uploadStatus = 'Doğrulama kaydı yazılıyor...');
+    }
+    final userId = FirebaseAuth.instance.currentUser?.uid;
+    if (userId != null) {
+      final result = vr.VerificationResult(
+        id: _sessionId,
+        accuracyScore: score,
+        classification: _mapClassification(classification),
+        presenceDetected: _facePresentFrames > 0,
+        appMode: _appMode,
+        subScores: {
+          'pill': _frameCount == 0 ? 0.0 : _pillOnTongueFrames / _frameCount,
+          'mouth': _frameCount == 0 ? 0.0 : _mouthOpenFrames / _frameCount,
+          'detectionConfirmed': detectionConfirmed ? 1.0 : 0.0,
+          'userConfirmed': userConfirmed ? 1.0 : 0.0,
+        },
+        footageUrl: footageUrl,
+        sectionIndex: widget.sectionIndex,
+        timestamp: DateTime.now(),
+      );
+      try {
+        await _cloudService.save(userId, result);
+      } catch (_) {}
+      if (widget.macAddress != null && widget.macAddress!.isNotEmpty) {
+        try {
+          await _cloudService.saveForDevice(
+            macAddress: widget.macAddress!,
+            result: result,
+            extraData: {
+              'storagePath': storagePath,
+              'sessionId': _sessionId,
+              'deviceId': _deviceId,
+              'detectionConfirmed': detectionConfirmed,
+              'userConfirmed': userConfirmed,
+              'highestPhase': _highestPhaseReached.name,
+            },
+          );
+        } catch (_) {}
+      }
+    }
+    if (mounted) {
+      setState(() {
+        _uploading = false;
+        _uploadStatus = '';
       });
     }
   }
 
-  Future<void> _finishScoring() async {
-    _stopStreaming();
-    _timeoutTimer?.cancel();
-    _stateTimer?.cancel();
-
-    try {
-      // 1. Calculate accuracy score
-      final pillScore = _capturedFrames.where((f) => f.pillDetected).length /
-          (_capturedFrames.isEmpty ? 1 : _capturedFrames.length);
-      final mouthScore =
-          _capturedFrames.where((f) => f.isMouthOpen).length /
-              (_capturedFrames.isEmpty ? 1 : _capturedFrames.length);
-
-      final score = _scoringEngine.calculate(
-        mode: _appMode == AppMode.device
-            ? ScoringMode.withDevice
-            : ScoringMode.deviceFree,
-        pill: pillScore.clamp(0.0, 1.0),
-        lip: pillScore.clamp(0.0, 1.0),
-        mouth: mouthScore.clamp(0.0, 1.0),
-        timing: 0.8,
-      );
-
-      final classification = _scoringEngine.classify(score);
-
-      // 2. Extract clip if suspicious
-      String footageUrl = '';
-      final userId = FirebaseAuth.instance.currentUser?.uid;
-
-      if (userId != null &&
-          classification == VerificationResult.suspicious) {
-        final clipPath = await _clipExtractor.extractIfSuspicious(
-          classification: classification,
-          buffer: _videoBuffer,
-          criticalTimestamps: _capturedFrames
-              .where((f) => f.pillDetected)
-              .map((f) => f.timestamp)
-              .toList(),
-          criticalLabels: ['pill_detected', 'pill_consumed'],
-        );
-
-        if (clipPath != null) {
-          try {
-            footageUrl = await _cloudService.upload(userId, clipPath);
-          } catch (e) {
-            debugPrint('[VerificationScreen] Upload failed: $e');
-          }
-        }
-      }
-
-      // 3. Save verification result to Firestore
-      if (userId != null) {
-        final result = vr.VerificationResult(
-          id: const Uuid().v4(),
-          accuracyScore: score,
-          classification: _mapClassification(classification),
-          presenceDetected:
-              _capturedFrames.any((f) => f.faceDetected),
-          appMode: _appMode,
-          subScores: {
-            'pill': pillScore,
-            'mouth': mouthScore,
-            'timing': 0.8,
-          },
-          footageUrl: footageUrl,
-          sectionIndex: widget.sectionIndex,
-          timestamp: DateTime.now(),
-        );
-
-        await _cloudService.save(userId, result);
-      }
-    } catch (e) {
-      debugPrint('[VerificationScreen] Scoring/save error: $e');
-    }
-
-    _transition(VerificationState.completed);
+  double _computeScore({required bool detectionConfirmed}) {
+    if (_frameCount == 0) return 0.0;
+    final pillRatio = _pillOnTongueFrames / _frameCount;
+    final mouthRatio = _mouthOpenFrames / _frameCount;
+    return _scoringEngine.calculate(
+      mode: _appMode == AppMode.device
+          ? ScoringMode.withDevice
+          : ScoringMode.deviceFree,
+      pill: pillRatio.clamp(0.0, 1.0),
+      lip: pillRatio.clamp(0.0, 1.0),
+      mouth: mouthRatio.clamp(0.0, 1.0),
+      timing: detectionConfirmed ? 1.0 : 0.4,
+    );
   }
 
   vr.VerificationClassification _mapClassification(
@@ -394,85 +521,217 @@ class _VerificationScreenState extends State<VerificationScreen>
     }
   }
 
-  void _startVerification() {
-    _capturedFrames.clear();
-    _timeoutTimer?.cancel();
-    _timeoutTimer = Timer(const Duration(seconds: 60), () {
-      if (!_verificationState.isTerminal) {
-        _transition(VerificationState.timeout);
-      }
-    });
-    setState(() => _verificationState = VerificationState.waitingForPill);
+  Color _phaseAccent(DetectionPhase phase) {
+    switch (phase) {
+      case DetectionPhase.noFace:
+      case DetectionPhase.swallowFailed:
+        return Colors.redAccent;
+      case DetectionPhase.faceDetected:
+        return Colors.orange;
+      case DetectionPhase.mouthOpen:
+      case DetectionPhase.mouthReopened:
+      case DetectionPhase.drinking:
+        return AppColors.skyBlue;
+      case DetectionPhase.pillOnTongue:
+      case DetectionPhase.mouthClosedWithPill:
+      case DetectionPhase.swallowConfirmed:
+        return AppColors.turquoise;
+      case DetectionPhase.timeoutExpired:
+        return Colors.grey;
+    }
   }
 
-  void _cancelVerification() {
-    _timeoutTimer?.cancel();
-    _stateTimer?.cancel();
-    _transition(VerificationState.cancelled);
+  IconData _phaseIcon(DetectionPhase phase) {
+    switch (phase) {
+      case DetectionPhase.noFace:
+        return Icons.face_retouching_off_rounded;
+      case DetectionPhase.faceDetected:
+        return Icons.face_rounded;
+      case DetectionPhase.mouthOpen:
+        return Icons.sentiment_satisfied_alt_rounded;
+      case DetectionPhase.pillOnTongue:
+        return Icons.medication_rounded;
+      case DetectionPhase.mouthClosedWithPill:
+        return Icons.no_food_rounded;
+      case DetectionPhase.drinking:
+        return Icons.local_drink_rounded;
+      case DetectionPhase.mouthReopened:
+        return Icons.sentiment_neutral_rounded;
+      case DetectionPhase.swallowConfirmed:
+        return Icons.verified_rounded;
+      case DetectionPhase.swallowFailed:
+        return Icons.error_outline_rounded;
+      case DetectionPhase.timeoutExpired:
+        return Icons.timer_off_rounded;
+    }
   }
 
-  Future<void> _toggleTorch() async {
-    if (_controller == null) return;
-    _torchOn = !_torchOn;
-    await _controller!.setFlashMode(
-      _torchOn ? FlashMode.torch : FlashMode.off,
-    );
-    setState(() {});
+  String _phaseLabel(DetectionPhase phase) {
+    switch (phase) {
+      case DetectionPhase.noFace:
+        return 'Yüz Bulunamadı';
+      case DetectionPhase.faceDetected:
+        return 'Yüz Algılandı';
+      case DetectionPhase.mouthOpen:
+        return 'Ağız Açık';
+      case DetectionPhase.pillOnTongue:
+        return 'Hap Dilde';
+      case DetectionPhase.mouthClosedWithPill:
+        return 'Ağız Kapandı';
+      case DetectionPhase.drinking:
+        return 'Su İçiliyor';
+      case DetectionPhase.mouthReopened:
+        return 'Ağız Yeniden Açıldı';
+      case DetectionPhase.swallowConfirmed:
+        return 'Yutma Onaylandı';
+      case DetectionPhase.swallowFailed:
+        return 'Yutma Başarısız';
+      case DetectionPhase.timeoutExpired:
+        return 'Süre Doldu';
+    }
   }
 
-  // ── Build ─────────────────────────────────────────────────────────────────
+  bool _stepReached(DetectionPhase phase, int step) {
+    int reached;
+    switch (phase) {
+      case DetectionPhase.noFace:
+      case DetectionPhase.timeoutExpired:
+        reached = 0;
+        break;
+      case DetectionPhase.faceDetected:
+        reached = 1;
+        break;
+      case DetectionPhase.mouthOpen:
+        reached = 2;
+        break;
+      case DetectionPhase.pillOnTongue:
+        reached = 3;
+        break;
+      case DetectionPhase.mouthClosedWithPill:
+        reached = 4;
+        break;
+      case DetectionPhase.drinking:
+      case DetectionPhase.mouthReopened:
+        reached = 5;
+        break;
+      case DetectionPhase.swallowConfirmed:
+      case DetectionPhase.swallowFailed:
+        reached = 6;
+        break;
+    }
+    return reached >= step;
+  }
 
   @override
   Widget build(BuildContext context) {
+    final phase = _lastResult.phase;
+    final accent = _phaseAccent(phase);
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: AppColors.background,
+      appBar: AppBar(
+        title: Text('İlaç Doğrulama',
+            style: GoogleFonts.inter(
+                fontWeight: FontWeight.w800, color: AppColors.deepSea)),
+        centerTitle: true,
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: AppColors.deepSea),
+        actions: [
+          IconButton(
+            icon: Icon(
+                _torchOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
+                color: AppColors.deepSea),
+            onPressed: _isCameraInitialized ? _toggleTorch : null,
+          ),
+          IconButton(
+            icon:
+                const Icon(Icons.refresh_rounded, color: AppColors.deepSea),
+            onPressed: _completed
+                ? null
+                : () {
+                    _service.reset();
+                    setState(() {
+                      _lastResult = PillOnTongueResult.empty();
+                      _frameCount = 0;
+                      _facePresentFrames = 0;
+                      _mouthOpenFrames = 0;
+                      _pillOnTongueFrames = 0;
+                      _highestPhaseReached = DetectionPhase.noFace;
+                    });
+                  },
+          ),
+        ],
+      ),
       body: Stack(
-        fit: StackFit.expand,
         children: [
-          // 1. Camera preview
-          if (_isCameraReady && _controller != null)
-            _MirroredPreview(controller: _controller!)
-          else
-            const Center(
-              child: CircularProgressIndicator(color: AppColors.skyBlue),
+          SafeArea(
+            child: Column(
+              children: [
+                Expanded(
+                  flex: 7,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+                    child: _CameraCard(
+                      controller: _controller,
+                      isInitialized: _isCameraInitialized,
+                      isFrontCamera: _isFrontCamera,
+                      lastResult: _lastResult,
+                      imageSize: _imageSize,
+                      rotation: _rotation,
+                      accent: accent,
+                      phaseLabel: _phaseLabel(phase),
+                      phaseIcon: _phaseIcon(phase),
+                      recording: _recording,
+                      recordingStartedAt: _recordingStartedAt,
+                      consentEnabled: _consentEnabled,
+                      lastFrameTime: _lastFrameTime,
+                    ),
+                  ),
+                ),
+                Expanded(
+                  flex: 3,
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                    physics: const BouncingScrollPhysics(),
+                    child: Column(
+                      children: [
+                        _GuidanceCard(
+                          accent: accent,
+                          icon: _phaseIcon(phase),
+                          title: _statusMessage ?? _phaseLabel(phase),
+                          subtitle: _recording
+                              ? 'Detection duraklatıldı (kayıt sürüyor) — '
+                                  'lütfen ilacınızı alıp yutun'
+                              : _lastResult.guidance,
+                        ),
+                        const SizedBox(height: 8),
+                        _StepTracker(
+                          steps: const [
+                            'Yüz',
+                            'Ağız',
+                            'Hap',
+                            'Kapat',
+                            'Su',
+                            'Yut'
+                          ],
+                          stepReached: (i) => _stepReached(phase, i),
+                          phase: phase,
+                        ),
+                        if (_completed) ...[
+                          const SizedBox(height: 12),
+                          _CompleteButton(
+                              onPressed: () => Navigator.of(context).pop()),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ],
             ),
-
-          // 2. Face detection overlay
-          if (_isCameraReady && _lastResult != null)
-            CustomPaint(
-              painter: FacePainter(
-                _lastResult!.face != null ? [_lastResult!.face!] : [],
-                imageSize: _imageSize,
-                rotation: _rotation,
-                isFrontCamera: _isFrontCamera,
-              ),
-            ),
-
-          // 3. Top bar
-          _TopBar(
-            appMode: _appMode,
-            torchOn: _torchOn,
-            onTorchToggle: _toggleTorch,
-            onClose: () {
-              _cancelVerification();
-              Navigator.of(context).pop();
-            },
           ),
-
-          // 4. Guidance overlay
-          _GuidanceOverlay(state: _verificationState),
-
-          // 5. Progress bar + bottom controls
-          _BottomControls(
-            state: _verificationState,
-            onStart: _startVerification,
-            onCancel: _cancelVerification,
-            onDone: () => Navigator.of(context).pop(),
-            // DEV: mock pill toggle (remove when real CVProcessor is wired)
-            onMockPillToggle: () =>
-                setState(() => _mockPillDetected = !_mockPillDetected),
-            mockPillActive: _mockPillDetected,
-          ),
+          if (_uploading)
+            _UploadOverlay(
+                progress: _uploadProgress, status: _uploadStatus),
         ],
       ),
     );
@@ -480,263 +739,171 @@ class _VerificationScreenState extends State<VerificationScreen>
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _timeoutTimer?.cancel();
-    _stateTimer?.cancel();
-    _stopStreaming();
+    _recordingTimeoutTimer?.cancel();
+    if (_controller?.value.isStreamingImages ?? false) {
+      _controller?.stopImageStream().catchError((_) {});
+    }
+    if (_controller?.value.isRecordingVideo ?? false) {
+      _controller?.stopVideoRecording().catchError((_) => XFile(''));
+    }
     _controller?.dispose();
-    _faceDetectionService.dispose();
+    _service.dispose();
     super.dispose();
   }
 }
 
-// ── Sub-widgets ───────────────────────────────────────────────────────────────
+class _CameraCard extends StatelessWidget {
+  final CameraController? controller;
+  final bool isInitialized;
+  final bool isFrontCamera;
+  final PillOnTongueResult lastResult;
+  final Size imageSize;
+  final InputImageRotation rotation;
+  final Color accent;
+  final String phaseLabel;
+  final IconData phaseIcon;
+  final bool recording;
+  final DateTime? recordingStartedAt;
+  final bool consentEnabled;
+  final DateTime? lastFrameTime;
 
-class _MirroredPreview extends StatelessWidget {
-  final CameraController controller;
-  const _MirroredPreview({required this.controller});
-
-  @override
-  Widget build(BuildContext context) {
-    return Transform(
-      alignment: Alignment.center,
-      transform: Matrix4.identity()..scale(-1.0, 1.0),
-      child: CameraPreview(controller),
-    );
-  }
-}
-
-class _TopBar extends StatelessWidget {
-  final AppMode appMode;
-  final bool torchOn;
-  final VoidCallback onTorchToggle;
-  final VoidCallback onClose;
-
-  const _TopBar({
-    required this.appMode,
-    required this.torchOn,
-    required this.onTorchToggle,
-    required this.onClose,
+  const _CameraCard({
+    required this.controller,
+    required this.isInitialized,
+    required this.isFrontCamera,
+    required this.lastResult,
+    required this.imageSize,
+    required this.rotation,
+    required this.accent,
+    required this.phaseLabel,
+    required this.phaseIcon,
+    required this.recording,
+    required this.recordingStartedAt,
+    required this.consentEnabled,
+    required this.lastFrameTime,
   });
 
+  bool get _framesAreStale {
+    if (lastFrameTime == null) return true;
+    return DateTime.now().difference(lastFrameTime!) >
+        const Duration(milliseconds: 1500);
+  }
+
+  bool get _rotated90or270 =>
+      rotation == InputImageRotation.rotation90deg ||
+      rotation == InputImageRotation.rotation270deg;
+
   @override
   Widget build(BuildContext context) {
-    return Positioned(
-      top: 0,
-      left: 0,
-      right: 0,
-      child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: Row(
+    if (!isInitialized || controller == null) {
+      return _shell(
+          child: const Center(
+              child: CircularProgressIndicator(color: AppColors.skyBlue)));
+    }
+    final preview = controller!.value.previewSize;
+    if (preview == null) {
+      return _shell(
+          child: const Center(child: CircularProgressIndicator()));
+    }
+    final w = _rotated90or270 ? preview.height : preview.width;
+    final h = _rotated90or270 ? preview.width : preview.height;
+    final aspect = w / h;
+
+    return _shell(
+      child: Center(
+        child: AspectRatio(
+          aspectRatio: aspect,
+          child: Stack(
+            fit: StackFit.expand,
             children: [
-              IconButton(
-                icon: const Icon(Icons.close_rounded, color: Colors.white),
-                onPressed: onClose,
-              ),
-              const Spacer(),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                decoration: BoxDecoration(
-                  color: Colors.black45,
-                  borderRadius: BorderRadius.circular(20),
+              CameraPreview(controller!),
+              // Painter çizilir EĞER:
+              //   - face algılanmış AND
+              //   - frame'ler güncel (< 1.5s eski) — yani concurrent çalışıyor
+              // Bu sayede recording sırasında frame'ler gelmeye devam ediyorsa
+              // dudak takibi canlı görünür; durmuşsa donmuş overlay gizlenir.
+              if (lastResult.face != null && !_framesAreStale)
+                CustomPaint(
+                  painter: PillPainter(
+                    result: lastResult,
+                    imageSize: imageSize,
+                    rotation: rotation,
+                    isFrontCamera: isFrontCamera,
+                  ),
                 ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      appMode == AppMode.device
-                          ? Icons.medication_liquid_rounded
-                          : Icons.smartphone_rounded,
-                      color: AppColors.turquoise,
-                      size: 14,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      appMode == AppMode.device ? 'Device' : 'Device-Free',
-                      style: GoogleFonts.inter(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.white,
+              // Recording sırasında frame'ler donmuşsa "kayıt sürüyor" göster
+              if (recording && _framesAreStale)
+                const _RecordingDimOverlay(),
+              if (recording && recordingStartedAt != null)
+                Positioned(
+                  top: 12,
+                  left: 12,
+                  child: _RecPill(startedAt: recordingStartedAt!),
+                ),
+              Positioned(
+                top: 12,
+                right: 12,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: accent,
+                    borderRadius: BorderRadius.circular(20),
+                    boxShadow: [
+                      BoxShadow(
+                        color: accent.withValues(alpha: 0.3),
+                        blurRadius: 8,
+                        offset: const Offset(0, 2),
                       ),
-                    ),
-                  ],
-                ),
-              ),
-              const Spacer(),
-              IconButton(
-                icon: Icon(
-                  torchOn ? Icons.flashlight_on_rounded : Icons.flashlight_off_rounded,
-                  color: torchOn ? Colors.yellow : Colors.white,
-                ),
-                onPressed: onTorchToggle,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _GuidanceOverlay extends StatelessWidget {
-  final VerificationState state;
-  const _GuidanceOverlay({required this.state});
-
-  @override
-  Widget build(BuildContext context) {
-    if (state == VerificationState.idle) return const SizedBox.shrink();
-
-    final isError = state == VerificationState.timeout ||
-        state == VerificationState.cancelled;
-    final isSuccess = state == VerificationState.completed ||
-        state == VerificationState.mouthVerified;
-
-    final color = isError
-        ? Colors.red.shade400
-        : isSuccess
-            ? AppColors.turquoise
-            : Colors.white;
-
-    final icon = isError
-        ? Icons.error_outline_rounded
-        : isSuccess
-            ? Icons.check_circle_outline_rounded
-            : Icons.info_outline_rounded;
-
-    return Positioned(
-      top: 120,
-      left: 24,
-      right: 24,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.55),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Row(
-          children: [
-            Icon(icon, color: color, size: 20),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                state.label,
-                style: GoogleFonts.inter(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                  color: color,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _BottomControls extends StatelessWidget {
-  final VerificationState state;
-  final VoidCallback onStart;
-  final VoidCallback onCancel;
-  final VoidCallback onDone;
-  final VoidCallback onMockPillToggle;
-  final bool mockPillActive;
-
-  const _BottomControls({
-    required this.state,
-    required this.onStart,
-    required this.onCancel,
-    required this.onDone,
-    required this.onMockPillToggle,
-    required this.mockPillActive,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Positioned(
-      bottom: 0,
-      left: 0,
-      right: 0,
-      child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // Progress bar
-              if (state != VerificationState.idle)
-                Column(
-                  children: [
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(4),
-                      child: LinearProgressIndicator(
-                        value: state.progress,
-                        minHeight: 6,
-                        backgroundColor: Colors.white24,
-                        valueColor: AlwaysStoppedAnimation<Color>(
-                          state == VerificationState.timeout ||
-                                  state == VerificationState.cancelled
-                              ? Colors.red
-                              : AppColors.turquoise,
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(phaseIcon, color: Colors.white, size: 16),
+                      const SizedBox(width: 6),
+                      Text(
+                        recording ? 'KAYIT' : phaseLabel,
+                        style: GoogleFonts.inter(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 12,
                         ),
                       ),
-                    ),
-                    const SizedBox(height: 16),
-                  ],
+                    ],
+                  ),
                 ),
-
-              // DEV: Mock pill toggle (visible only during active session)
-              if (state != VerificationState.idle &&
-                  !state.isTerminal &&
-                  state != VerificationState.completed)
-                GestureDetector(
-                  onTap: onMockPillToggle,
+              ),
+              if (!consentEnabled)
+                Positioned(
+                  left: 12,
+                  right: 12,
+                  bottom: 12,
                   child: Container(
-                    margin: const EdgeInsets.only(bottom: 12),
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 8),
+                        horizontal: 12, vertical: 8),
                     decoration: BoxDecoration(
-                      color: mockPillActive
-                          ? Colors.orange.withOpacity(0.2)
-                          : Colors.white12,
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(
-                        color: mockPillActive ? Colors.orange : Colors.white24,
-                      ),
+                      color: Colors.amber.shade400,
+                      borderRadius: BorderRadius.circular(12),
                     ),
                     child: Row(
-                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(Icons.science_rounded,
-                            size: 14,
-                            color: mockPillActive
-                                ? Colors.orange
-                                : Colors.white54),
-                        const SizedBox(width: 8),
-                        Text(
-                          mockPillActive
-                              ? 'Mock pill: ON'
-                              : 'Mock pill: OFF',
-                          style: GoogleFonts.inter(
-                            fontSize: 12,
-                            color: mockPillActive
-                                ? Colors.orange
-                                : Colors.white54,
+                        const Icon(Icons.info_outline_rounded, size: 16),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            'KVKK onayı yok — kayıt yapılmıyor.',
+                            style: GoogleFonts.inter(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.black87,
+                            ),
                           ),
                         ),
                       ],
                     ),
                   ),
                 ),
-
-              // Action button
-              SizedBox(
-                width: double.infinity,
-                height: 52,
-                child: _actionButton(),
-              ),
             ],
           ),
         ),
@@ -744,60 +911,309 @@ class _BottomControls extends StatelessWidget {
     );
   }
 
-  Widget _actionButton() {
-    if (state == VerificationState.idle) {
-      return _GradientButton(
-        label: 'Start Verification',
-        icon: Icons.play_arrow_rounded,
-        onTap: onStart,
-      );
-    }
-    if (state.isTerminal || state == VerificationState.completed) {
-      return _GradientButton(
-        label: 'Done',
-        icon: Icons.check_rounded,
-        onTap: onDone,
-      );
-    }
-    return OutlinedButton.icon(
-      onPressed: onCancel,
-      icon: const Icon(Icons.stop_rounded, color: Colors.white70),
-      label: Text(
-        'Cancel',
-        style: GoogleFonts.inter(color: Colors.white70),
+  Widget _shell({required Widget child}) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.blueGrey.shade50, width: 1),
+        boxShadow: [
+          BoxShadow(
+            color: AppColors.deepSea.withValues(alpha: 0.10),
+            blurRadius: 18,
+            offset: const Offset(0, 6),
+          ),
+        ],
       ),
-      style: OutlinedButton.styleFrom(
-        side: const BorderSide(color: Colors.white30),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: child,
       ),
     );
   }
 }
 
-class _GradientButton extends StatelessWidget {
-  final String label;
-  final IconData icon;
-  final VoidCallback onTap;
+/// Recording sırasında ekrana hafif karartma + büyük kayıt animasyonu.
+/// Painter gizlendiği için kullanıcı "donmuş takip" yerine bunu görür.
+class _RecordingDimOverlay extends StatefulWidget {
+  const _RecordingDimOverlay();
+  @override
+  State<_RecordingDimOverlay> createState() => _RecordingDimOverlayState();
+}
 
-  const _GradientButton({
-    required this.label,
+class _RecordingDimOverlayState extends State<_RecordingDimOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: ColoredBox(
+          color: Colors.black.withValues(alpha: 0.18),
+          child: Center(
+            child: ScaleTransition(
+              scale: Tween<double>(begin: 0.9, end: 1.05).animate(
+                CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut),
+              ),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 18, vertical: 10),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.fiber_manual_record,
+                        color: Colors.redAccent, size: 18),
+                    const SizedBox(width: 8),
+                    Text(
+                      'KAYIT SÜRÜYOR',
+                      style: GoogleFonts.inter(
+                        color: Colors.white,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _GuidanceCard extends StatelessWidget {
+  final Color accent;
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  const _GuidanceCard({
+    required this.accent,
     required this.icon,
-    required this.onTap,
+    required this.title,
+    required this.subtitle,
   });
 
   @override
   Widget build(BuildContext context) {
     return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.blueGrey.shade50),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.04),
+            blurRadius: 8,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              color: accent.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, color: accent, size: 22),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.inter(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                    color: AppColors.deepSea,
+                  ),
+                ),
+                if (subtitle.isNotEmpty)
+                  Text(
+                    subtitle,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      color: const Color(0xFF475569),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StepTracker extends StatelessWidget {
+  final List<String> steps;
+  final bool Function(int) stepReached;
+  final DetectionPhase phase;
+  const _StepTracker({
+    required this.steps,
+    required this.stepReached,
+    required this.phase,
+  });
+
+  Color _stepColor(int i) {
+    final palette = const [
+      Colors.orange,
+      AppColors.skyBlue,
+      AppColors.turquoise,
+      Colors.amber,
+      Colors.lightBlue,
+      AppColors.turquoise,
+    ];
+    if (i == 6 && phase == DetectionPhase.swallowFailed) {
+      return Colors.redAccent;
+    }
+    return palette[i - 1];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(10, 12, 10, 10),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.blueGrey.shade50),
+      ),
+      child: Row(
+        children: [
+          for (int i = 1; i <= steps.length; i++) ...[
+            _StepDot(
+              label: steps[i - 1],
+              active: stepReached(i),
+              color: _stepColor(i),
+            ),
+            if (i < steps.length) _StepLine(active: stepReached(i + 1)),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _StepDot extends StatelessWidget {
+  final String label;
+  final bool active;
+  final Color color;
+  const _StepDot({
+    required this.label,
+    required this.active,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 250),
+          width: 22,
+          height: 22,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: active ? color : Colors.blueGrey.shade100,
+            boxShadow: active
+                ? [
+                    BoxShadow(
+                      color: color.withValues(alpha: 0.4),
+                      blurRadius: 5,
+                      offset: const Offset(0, 2),
+                    ),
+                  ]
+                : null,
+          ),
+          child: active
+              ? const Icon(Icons.check_rounded,
+                  color: Colors.white, size: 14)
+              : null,
+        ),
+        const SizedBox(height: 3),
+        Text(
+          label,
+          style: GoogleFonts.inter(
+            color: active ? color : Colors.blueGrey.shade300,
+            fontSize: 9,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StepLine extends StatelessWidget {
+  final bool active;
+  const _StepLine({required this.active});
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 250),
+        height: 2,
+        margin: const EdgeInsets.only(bottom: 14, left: 1, right: 1),
+        color: active ? AppColors.skyBlue : Colors.blueGrey.shade100,
+      ),
+    );
+  }
+}
+
+class _CompleteButton extends StatelessWidget {
+  final VoidCallback onPressed;
+  const _CompleteButton({required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(14),
         gradient: const LinearGradient(
           colors: [AppColors.skyBlue, AppColors.deepSea],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        borderRadius: BorderRadius.circular(30),
         boxShadow: [
           BoxShadow(
-            color: AppColors.deepSea.withOpacity(0.3),
+            color: AppColors.deepSea.withValues(alpha: 0.25),
             blurRadius: 12,
             offset: const Offset(0, 4),
           ),
@@ -806,20 +1222,169 @@ class _GradientButton extends StatelessWidget {
       child: Material(
         color: Colors.transparent,
         child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(30),
-          child: Center(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(14),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
             child: Row(
-              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Icon(icon, color: Colors.white, size: 20),
+                const Icon(Icons.check_rounded,
+                    color: Colors.white, size: 18),
                 const SizedBox(width: 8),
                 Text(
-                  label,
+                  'Tamamla',
                   style: GoogleFonts.inter(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
                     color: Colors.white,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RecPill extends StatefulWidget {
+  final DateTime startedAt;
+  const _RecPill({required this.startedAt});
+  @override
+  State<_RecPill> createState() => _RecPillState();
+}
+
+class _RecPillState extends State<_RecPill>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  Timer? _t;
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    )..repeat(reverse: true);
+    _t = Timer.periodic(
+        const Duration(milliseconds: 250), (_) => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    _t?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final elapsed = DateTime.now().difference(widget.startedAt).inSeconds;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FadeTransition(
+            opacity: _ctrl,
+            child: const Icon(Icons.fiber_manual_record,
+                color: Colors.redAccent, size: 12),
+          ),
+          const SizedBox(width: 5),
+          Text(
+            'REC ${elapsed}s/30s',
+            style: GoogleFonts.inter(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+              fontSize: 10,
+              letterSpacing: 0.5,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _UploadOverlay extends StatelessWidget {
+  final double progress;
+  final String status;
+  const _UploadOverlay({required this.progress, required this.status});
+
+  @override
+  Widget build(BuildContext context) {
+    final pct = (progress.clamp(0.0, 1.0) * 100).toStringAsFixed(0);
+    return Positioned.fill(
+      child: ColoredBox(
+        color: AppColors.deepSea.withValues(alpha: 0.65),
+        child: Center(
+          child: Container(
+            margin: const EdgeInsets.symmetric(horizontal: 32),
+            padding: const EdgeInsets.all(28),
+            decoration: BoxDecoration(
+              color: AppColors.surface,
+              borderRadius: BorderRadius.circular(24),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.25),
+                  blurRadius: 24,
+                  offset: const Offset(0, 8),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 96,
+                  height: 96,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      SizedBox(
+                        width: 96,
+                        height: 96,
+                        child: CircularProgressIndicator(
+                          value: progress > 0 ? progress : null,
+                          strokeWidth: 6,
+                          backgroundColor:
+                              AppColors.skyBlue.withValues(alpha: 0.15),
+                          valueColor: const AlwaysStoppedAnimation<Color>(
+                              AppColors.skyBlue),
+                        ),
+                      ),
+                      Text(
+                        '$pct%',
+                        style: GoogleFonts.inter(
+                          fontSize: 22,
+                          fontWeight: FontWeight.w800,
+                          color: AppColors.deepSea,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  'Video İşleniyor',
+                  style: GoogleFonts.inter(
+                    fontSize: 17,
+                    fontWeight: FontWeight.w800,
+                    color: AppColors.deepSea,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  status.isEmpty ? 'Lütfen bekleyin...' : status,
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: const Color(0xFF475569),
                   ),
                 ),
               ],

@@ -482,8 +482,20 @@ class _UnifiedTestScreenState extends ConsumerState<UnifiedTestScreen> {
         return Colors.orange;
       case DetectionPhase.mouthOpen:
         return Colors.blue;
-      case DetectionPhase.pillDetected:
+      case DetectionPhase.pillOnTongue:
         return Colors.green;
+      case DetectionPhase.mouthClosedWithPill:
+        return Colors.teal;
+      case DetectionPhase.drinking:
+        return Colors.cyan;
+      case DetectionPhase.mouthReopened:
+        return Colors.lightBlue;
+      case DetectionPhase.swallowConfirmed:
+        return Colors.greenAccent;
+      case DetectionPhase.swallowFailed:
+        return Colors.redAccent;
+      case DetectionPhase.timeoutExpired:
+        return Colors.grey;
     }
   }
 
@@ -495,8 +507,20 @@ class _UnifiedTestScreenState extends ConsumerState<UnifiedTestScreen> {
         return Icons.face;
       case DetectionPhase.mouthOpen:
         return Icons.mood;
-      case DetectionPhase.pillDetected:
+      case DetectionPhase.pillOnTongue:
         return Icons.check_circle;
+      case DetectionPhase.mouthClosedWithPill:
+        return Icons.no_food;
+      case DetectionPhase.drinking:
+        return Icons.local_drink;
+      case DetectionPhase.mouthReopened:
+        return Icons.mood_outlined;
+      case DetectionPhase.swallowConfirmed:
+        return Icons.verified;
+      case DetectionPhase.swallowFailed:
+        return Icons.error;
+      case DetectionPhase.timeoutExpired:
+        return Icons.timer_off;
     }
   }
 
@@ -508,8 +532,20 @@ class _UnifiedTestScreenState extends ConsumerState<UnifiedTestScreen> {
         return 'Yüz Algılandı';
       case DetectionPhase.mouthOpen:
         return 'Ağız Açık';
-      case DetectionPhase.pillDetected:
-        return 'Hap Algılandı!';
+      case DetectionPhase.pillOnTongue:
+        return 'Hap Dilde';
+      case DetectionPhase.mouthClosedWithPill:
+        return 'Ağız Kapandı (Hap İçeride)';
+      case DetectionPhase.drinking:
+        return 'Su İçiliyor';
+      case DetectionPhase.mouthReopened:
+        return 'Ağız Yeniden Açıldı';
+      case DetectionPhase.swallowConfirmed:
+        return 'Yutma Onaylandı';
+      case DetectionPhase.swallowFailed:
+        return 'Yutma Başarısız';
+      case DetectionPhase.timeoutExpired:
+        return 'Süre Doldu';
     }
   }
 
@@ -651,7 +687,6 @@ class _RecordingIndicatorState extends State<_RecordingIndicator>
     );
   }
 }
-
 class _DonePanel extends StatelessWidget {
   final CameraDone state;
   const _DonePanel({required this.state});

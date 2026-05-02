@@ -45,6 +45,9 @@ dependencies:
   # Firebase Storage (video upload)
   firebase_storage: ^12.3.7
   path_provider: ^2.1.5
+
+  # Date/time formatting (relative review screen)
+  intl: ^0.20.2
 dev_dependencies:
   flutter_test:
     sdk: flutter

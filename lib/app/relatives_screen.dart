@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:medTrackPlus/app/relative_review_screen.dart';
 import 'package:medTrackPlus/app/reports_screen.dart';
 import 'package:medTrackPlus/services/auth_service.dart';
 import 'package:medTrackPlus/services/database_service.dart';
@@ -209,34 +210,67 @@ class _RelativesScreenState extends State<RelativesScreen> {
 
                               return Column(
                                 children: devices.map((device) {
-                                  return ListTile(
-                                    contentPadding: const EdgeInsets.only(left: 72, right: 16),
-                                    title: Text(device['name']!, style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF0F5191))),
-                                    subtitle: Text(device['mac']!, style: TextStyle(fontSize: 12, color: Colors.blueGrey)),
-                                    trailing: const Icon(Icons.bar_chart_rounded, color: Color(0xFF36C0A6)),
-                                    onTap: () async {
-                                      // 1. Kullanıcı ID'sini bul
-                                      String? targetUid = await _dbService.getUserIdByEmail(email);
-                                      if (targetUid == null) {
-                                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Kullanıcı verisine ulaşılamadı.")));
-                                        return;
-                                      }
-
-                                      // 2. Feedback açık mı kontrol et
-                                      bool isFeedbackOn = await _dbService.getDeviceFeedbackPreference(targetUid, device['mac']!);
-
-                                      if (isFeedbackOn) {
-                                        Navigator.push(context, MaterialPageRoute(
-                                            builder: (context) => ReportsScreen(
-                                              macAddress: device['mac']!,
-                                              targetUserId: targetUid,
-                                              titlePrefix: displayName,
-                                            )
-                                        ));
-                                      } else {
-                                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Bu kullanıcı geri bildirimi kapatmış.")));
-                                      }
-                                    },
+                                  return Padding(
+                                    padding: const EdgeInsets.only(left: 60, right: 16, bottom: 6),
+                                    child: Column(
+                                      children: [
+                                        // Birincil eylem: video doğrulama incelemesi
+                                        ListTile(
+                                          contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                                          tileColor: Colors.white,
+                                          shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(12),
+                                            side: BorderSide(color: Colors.blueGrey.shade50),
+                                          ),
+                                          leading: const Icon(Icons.videocam_rounded, color: Color(0xFF1D8AD6)),
+                                          title: Text(
+                                            device['name']!,
+                                            style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF0F5191)),
+                                          ),
+                                          subtitle: Text(
+                                            'Video doğrulama incele • ${device['mac']!}',
+                                            style: TextStyle(fontSize: 11, color: Colors.blueGrey.shade600),
+                                          ),
+                                          trailing: const Icon(Icons.chevron_right_rounded, color: Color(0xFF36C0A6)),
+                                          onTap: () {
+                                            Navigator.push(context, MaterialPageRoute(
+                                              builder: (_) => RelativeReviewScreen(
+                                                macAddress: device['mac']!,
+                                              ),
+                                            ));
+                                          },
+                                        ),
+                                        const SizedBox(height: 6),
+                                        // İkincil eylem: istatistik raporu
+                                        Padding(
+                                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                                          child: TextButton.icon(
+                                            onPressed: () async {
+                                              String? targetUid = await _dbService.getUserIdByEmail(email);
+                                              if (targetUid == null) {
+                                                if (!context.mounted) return;
+                                                ScaffoldMessenger.of(context).showSnackBar(
+                                                    const SnackBar(content: Text('Kullanıcı verisine ulaşılamadı.')));
+                                                return;
+                                              }
+                                              if (!context.mounted) return;
+                                              Navigator.push(context, MaterialPageRoute(
+                                                builder: (_) => ReportsScreen(
+                                                  macAddress: device['mac']!,
+                                                  targetUserId: targetUid,
+                                                  titlePrefix: displayName,
+                                                ),
+                                              ));
+                                            },
+                                            icon: const Icon(Icons.bar_chart_rounded, size: 18),
+                                            label: const Text('İstatistik raporunu aç'),
+                                            style: TextButton.styleFrom(
+                                              foregroundColor: const Color(0xFF36C0A6),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
                                   );
                                 }).toList(),
                               );

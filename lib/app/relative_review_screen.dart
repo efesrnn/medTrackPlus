@@ -1,16 +1,29 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
-import 'package:medTrackPlus/main.dart';
+import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:intl/intl.dart';
+import 'package:medTrackPlus/beta/verification/cloud_verification_service.dart';
+import 'package:medTrackPlus/main.dart' show AppColors;
 import 'package:video_player/video_player.dart';
 
+/// Relative-side review of medication verification sessions.
+///
+/// Layout:
+///   AppBar (transparent + deepSea title)
+///   ┌── Header card (device + count) ────────────────────────────────┐
+///   ┌── Recent recordings carousel (newest first) ───────────────────┐
+///   ┌── Selected video (player + custom controls) ──────────────────┐
+///   ┌── Metadata card (score, classification, timing, decisions) ──┐
+///   ┌── Approve / Deny gradient buttons ────────────────────────────┐
 class RelativeReviewScreen extends StatefulWidget {
   final String macAddress;
-  final String verificationId;
+  final String? verificationId;
 
   const RelativeReviewScreen({
     super.key,
     required this.macAddress,
-    required this.verificationId,
+    this.verificationId,
   });
 
   @override
@@ -18,20 +31,27 @@ class RelativeReviewScreen extends StatefulWidget {
 }
 
 class _RelativeReviewScreenState extends State<RelativeReviewScreen> {
+  final CloudVerificationService _cloud = CloudVerificationService();
+
+  bool _loadingList = true;
+  String? _listError;
+  List<Map<String, dynamic>> _videos = [];
+
+  Map<String, dynamic>? _selected;
   Map<String, dynamic>? _verification;
-  bool _loading = true;
-  String? _error;
+  String? _selectedDocId;
 
   VideoPlayerController? _videoController;
   bool _videoInitialized = false;
   String? _videoError;
 
   bool _submitting = false;
+  bool _loadingDetail = false;
 
   @override
   void initState() {
     super.initState();
-    _loadVerification();
+    _loadVideoList();
   }
 
   @override
@@ -40,651 +60,342 @@ class _RelativeReviewScreenState extends State<RelativeReviewScreen> {
     super.dispose();
   }
 
-  Future<void> _loadVerification() async {
+  Future<void> _loadVideoList() async {
+    setState(() {
+      _loadingList = true;
+      _listError = null;
+    });
     try {
-      final doc = await FirebaseFirestore.instance
-          .collection('dispenser').doc(widget.macAddress)
-          .collection('verifications').doc(widget.verificationId)
-          .get();
-
-      if (doc.exists) {
-        setState(() {
-          _verification = doc.data();
-          _loading = false;
-        });
-        _initVideoIfAvailable();
-      } else {
-        setState(() {
-          _loading = false;
-          _error = 'Verification not found';
-        });
+      final list = await _cloud.listVideos(widget.macAddress);
+      if (!mounted) return;
+      setState(() {
+        _videos = list;
+        _loadingList = false;
+      });
+      if (widget.verificationId != null) {
+        await _selectByVerificationId(widget.verificationId!);
+      } else if (list.isNotEmpty) {
+        await _selectVideo(list.first);
       }
     } catch (e) {
-      setState(() {
-        _loading = false;
-        _error = 'Failed to load verification: $e';
-      });
+      if (mounted) {
+        setState(() {
+          _listError = 'Videolar yüklenemedi: $e';
+          _loadingList = false;
+        });
+      }
     }
   }
 
-  void _initVideoIfAvailable() {
-    final url = _verification?['footageUrl'] ?? '';
-    if (url.isEmpty) return;
+  Future<void> _selectByVerificationId(String verificationId) async {
+    try {
+      final doc = await FirebaseFirestore.instance
+          .collection('dispenser')
+          .doc(widget.macAddress)
+          .collection('verifications')
+          .doc(verificationId)
+          .get();
+      if (doc.exists) {
+        final data = doc.data()!;
+        final storagePath = data['storagePath'] as String?;
+        Map<String, dynamic>? matchingVideo;
+        if (storagePath != null) {
+          final found =
+              _videos.where((v) => v['fullPath'] == storagePath).toList();
+          matchingVideo = found.isEmpty ? null : found.first;
+        }
+        if (!mounted) return;
+        setState(() {
+          _selectedDocId = verificationId;
+          _verification = data;
+          _selected = matchingVideo;
+        });
+        _initVideoFor(data['footageUrl'] as String? ?? '');
+        return;
+      }
+    } catch (_) {}
+    if (_videos.isNotEmpty) {
+      await _selectVideo(_videos.first);
+    }
+  }
 
-    _videoController = VideoPlayerController.networkUrl(Uri.parse(url))
-      ..initialize().then((_) {
-        if (mounted) setState(() => _videoInitialized = true);
-      }).catchError((e) {
-        if (mounted) setState(() => _videoError = 'Video could not be loaded');
+  Future<void> _selectVideo(Map<String, dynamic> video) async {
+    setState(() {
+      _selected = video;
+      _selectedDocId = null;
+      _verification = null;
+      _loadingDetail = true;
+    });
+
+    try {
+      final query = await FirebaseFirestore.instance
+          .collection('dispenser')
+          .doc(widget.macAddress)
+          .collection('verifications')
+          .where('storagePath', isEqualTo: video['fullPath'])
+          .limit(1)
+          .get();
+      if (!mounted) return;
+      if (query.docs.isNotEmpty) {
+        final doc = query.docs.first;
+        setState(() {
+          _verification = doc.data();
+          _selectedDocId = doc.id;
+          _loadingDetail = false;
+        });
+      } else {
+        setState(() => _loadingDetail = false);
+      }
+    } catch (_) {
+      if (mounted) setState(() => _loadingDetail = false);
+    }
+
+    _initVideoFor(video['downloadUrl'] as String? ?? '');
+  }
+
+  void _initVideoFor(String url) {
+    _videoController?.dispose();
+    _videoController = null;
+    if (mounted) {
+      setState(() {
+        _videoInitialized = false;
+        _videoError = null;
       });
+    }
+    if (url.isEmpty) {
+      if (mounted) setState(() => _videoError = 'Video bulunamadı');
+      return;
+    }
+    final ctrl = VideoPlayerController.networkUrl(Uri.parse(url));
+    _videoController = ctrl;
+    ctrl.initialize().then((_) {
+      if (mounted) setState(() => _videoInitialized = true);
+    }).catchError((e) {
+      if (mounted) setState(() => _videoError = 'Video yüklenemedi');
+    });
   }
 
   Future<void> _submitDecision(String decision) async {
+    if (_selectedDocId == null) return;
     setState(() => _submitting = true);
     try {
       await FirebaseFirestore.instance
-          .collection('dispenser').doc(widget.macAddress)
-          .collection('verifications').doc(widget.verificationId)
-          .update({'review_decision': decision});
-
-      if (mounted) {
-        setState(() {
-          _verification!['review_decision'] = decision;
-          _submitting = false;
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(decision == 'approved' ? 'Approved successfully' : 'Denied'),
-            backgroundColor: decision == 'approved' ? Colors.green : Colors.redAccent,
-          ),
-        );
-      }
+          .collection('dispenser')
+          .doc(widget.macAddress)
+          .collection('verifications')
+          .doc(_selectedDocId)
+          .update({
+        'review_decision': decision,
+        'review_timestamp': FieldValue.serverTimestamp(),
+      });
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(decision == 'approved' ? 'Onaylandı.' : 'Reddedildi.'),
+        backgroundColor:
+            decision == 'approved' ? AppColors.turquoise : Colors.redAccent,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ));
+      await _selectByVerificationId(_selectedDocId!);
     } catch (e) {
       if (mounted) {
-        setState(() => _submitting = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to submit: $e'), backgroundColor: Colors.redAccent),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Karar gönderilemedi: $e'),
+          backgroundColor: Colors.redAccent,
+        ));
       }
+    } finally {
+      if (mounted) setState(() => _submitting = false);
     }
   }
+
+  // ── UI ───────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
-        title: const Text('Verification Review'),
+        title: Text(
+          'Yakın İncelemesi',
+          style: GoogleFonts.inter(
+            fontWeight: FontWeight.w800,
+            color: AppColors.deepSea,
+          ),
+        ),
+        centerTitle: true,
         backgroundColor: Colors.transparent,
         elevation: 0,
         iconTheme: const IconThemeData(color: AppColors.deepSea),
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator(color: AppColors.skyBlue))
-          : _error != null
-              ? _buildErrorState(_error!)
-              : SingleChildScrollView(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      _buildVideoArea(),
-                      const SizedBox(height: 20),
-                      _buildClassificationBadge(),
-                      const SizedBox(height: 16),
-                      _buildModeIndicator(),
-                      const SizedBox(height: 16),
-                      _buildAccuracySection(),
-                      const SizedBox(height: 16),
-                      _buildPhaseIndicators(),
-                      const SizedBox(height: 16),
-                      _buildDetailsPanel(),
-                      const SizedBox(height: 24),
-                      _buildActionButtons(),
-                    ],
-                  ),
-                ),
-    );
-  }
-
-  Widget _buildErrorState(String message) {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.error_outline_rounded, size: 80, color: Colors.grey.shade300),
-          const SizedBox(height: 20),
-          Text(message, style: TextStyle(color: Colors.grey.shade500, fontSize: 16)),
-          const SizedBox(height: 20),
-          ElevatedButton.icon(
-            onPressed: () {
-              setState(() { _loading = true; _error = null; });
-              _loadVerification();
-            },
-            icon: const Icon(Icons.refresh),
-            label: const Text('Retry'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.skyBlue,
-              foregroundColor: Colors.white,
-            ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh_rounded,
+                color: AppColors.deepSea),
+            tooltip: 'Yenile',
+            onPressed: _loadingList ? null : _loadVideoList,
           ),
         ],
       ),
-    );
-  }
-
-  Widget _buildVideoArea() {
-    final footageUrl = _verification?['footageUrl'] ?? '';
-    final isDeviceFree = (_verification?['appMode'] ?? '') == 'deviceFree';
-
-    if (footageUrl.isEmpty) {
-      return Container(
-        height: 180,
-        decoration: BoxDecoration(
-          color: const Color(0xFF1A1A2E),
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(Icons.videocam_off_rounded, size: 48, color: Colors.white.withOpacity(0.25)),
-              const SizedBox(height: 8),
-              Text(
-                isDeviceFree ? 'No video in device-free mode' : 'No video recording',
-                style: TextStyle(color: Colors.white.withOpacity(0.25), fontSize: 13),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    if (_videoError != null) {
-      return Container(
-        height: 220,
-        decoration: BoxDecoration(
-          color: const Color(0xFF1A1A2E),
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.broken_image_rounded, size: 48, color: Colors.redAccent),
-              const SizedBox(height: 8),
-              Text(_videoError!, style: const TextStyle(color: Colors.white54, fontSize: 13)),
-            ],
-          ),
-        ),
-      );
-    }
-
-    if (!_videoInitialized) {
-      return Container(
-        height: 220,
-        decoration: BoxDecoration(
-          color: const Color(0xFF1A1A2E),
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: const Center(child: CircularProgressIndicator(color: Colors.white54)),
-      );
-    }
-
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(20),
-      child: Container(
-        color: const Color(0xFF1A1A2E),
-        child: Column(
-          children: [
-            AspectRatio(
-              aspectRatio: _videoController!.value.aspectRatio,
-              child: VideoPlayer(_videoController!),
-            ),
-            VideoProgressIndicator(
-              _videoController!,
-              allowScrubbing: true,
-              colors: const VideoProgressColors(
-                playedColor: AppColors.turquoise,
-                bufferedColor: Colors.white24,
-                backgroundColor: Colors.white12,
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  IconButton(
-                    onPressed: () => _videoController!.seekTo(Duration.zero),
-                    icon: const Icon(Icons.replay, color: Colors.white70, size: 22),
+      body: _loadingList
+          ? const Center(
+              child: CircularProgressIndicator(color: AppColors.skyBlue),
+            )
+          : _listError != null
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(_listError!,
+                        style: GoogleFonts.inter(
+                            color: Colors.redAccent, fontSize: 14)),
                   ),
-                  IconButton(
-                    onPressed: () {
-                      setState(() {
-                        _videoController!.value.isPlaying
-                            ? _videoController!.pause()
-                            : _videoController!.play();
-                      });
-                    },
-                    icon: Icon(
-                      _videoController!.value.isPlaying ? Icons.pause : Icons.play_arrow,
-                      color: Colors.white, size: 32,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildClassificationBadge() {
-    final classification = _verification?['classification'] ?? 'unknown';
-    final reviewDecision = _verification?['review_decision'];
-
-    Color classColor;
-    IconData classIcon;
-    String classText;
-
-    switch (classification) {
-      case 'success':
-        classColor = Colors.green;
-        classIcon = Icons.check_circle_rounded;
-        classText = 'Success';
-        break;
-      case 'suspicious':
-        classColor = Colors.orange;
-        classIcon = Icons.warning_amber_rounded;
-        classText = 'Suspicious';
-        break;
-      case 'rejected':
-        classColor = Colors.redAccent;
-        classIcon = Icons.cancel_rounded;
-        classText = 'Rejected';
-        break;
-      default:
-        classColor = Colors.grey;
-        classIcon = Icons.help_outline_rounded;
-        classText = 'Unknown';
-    }
-
-    return Row(
-      children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-          decoration: BoxDecoration(
-            color: classColor.withOpacity(0.1),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Row(
-            children: [
-              Icon(classIcon, color: classColor, size: 20),
-              const SizedBox(width: 6),
-              Text(classText, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: classColor)),
-            ],
-          ),
-        ),
-        const Spacer(),
-        if (reviewDecision != null)
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: reviewDecision == 'approved' ? Colors.green.withOpacity(0.1) : Colors.red.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Text(
-              reviewDecision == 'approved' ? 'Approved' : 'Denied',
-              style: TextStyle(
-                fontWeight: FontWeight.w600,
-                fontSize: 13,
-                color: reviewDecision == 'approved' ? Colors.green : Colors.redAccent,
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-
-  Widget _buildModeIndicator() {
-    final appMode = _verification?['appMode'] ?? 'device';
-    final isDeviceFree = appMode == 'deviceFree';
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      decoration: BoxDecoration(
-        color: isDeviceFree ? Colors.purple.withOpacity(0.08) : AppColors.skyBlue.withOpacity(0.08),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: isDeviceFree ? Colors.purple.withOpacity(0.2) : AppColors.skyBlue.withOpacity(0.2),
-        ),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            isDeviceFree ? Icons.phone_android : Icons.devices_rounded,
-            color: isDeviceFree ? Colors.purple : AppColors.skyBlue,
-            size: 20,
-          ),
-          const SizedBox(width: 8),
-          Text(
-            isDeviceFree ? 'Device-Free Mode' : 'Device Mode',
-            style: TextStyle(
-              fontWeight: FontWeight.w600,
-              color: isDeviceFree ? Colors.purple : AppColors.skyBlue,
-              fontSize: 14,
-            ),
-          ),
-          const Spacer(),
-          if (!isDeviceFree)
-            Text(widget.macAddress, style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAccuracySection() {
-    final score = (_verification?['accuracyScore'] ?? 0).toDouble();
-    final Map<String, dynamic> subScoresRaw = Map<String, dynamic>.from(_verification?['subScores'] ?? {});
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.blueGrey.shade50),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(Icons.speed_rounded, color: _scoreColor(score), size: 22),
-              const SizedBox(width: 8),
-              const Text('Accuracy Score', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.deepSea)),
-              const Spacer(),
-              Text('${(score * 100).toStringAsFixed(1)}%',
-                  style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18, color: _scoreColor(score))),
-            ],
-          ),
-          const SizedBox(height: 12),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(6),
-            child: LinearProgressIndicator(
-              value: score.clamp(0.0, 1.0),
-              minHeight: 8,
-              backgroundColor: Colors.grey.shade200,
-              valueColor: AlwaysStoppedAnimation(_scoreColor(score)),
-            ),
-          ),
-          if (subScoresRaw.isNotEmpty) ...[
-            const SizedBox(height: 16),
-            const Text('Sub-Scores', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: Colors.grey)),
-            const SizedBox(height: 10),
-            ...subScoresRaw.entries.map((e) {
-              final val = (e.value as num).toDouble();
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(_subScoreIcon(e.key), size: 16, color: _scoreColor(val)),
-                        const SizedBox(width: 6),
-                        Text(_subScoreLabel(e.key),
-                            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: AppColors.deepSea)),
-                        const Spacer(),
-                        Text('${(val * 100).toStringAsFixed(0)}%',
-                            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: _scoreColor(val))),
-                      ],
-                    ),
-                    const SizedBox(height: 4),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(4),
-                      child: LinearProgressIndicator(
-                        value: val.clamp(0.0, 1.0),
-                        minHeight: 5,
-                        backgroundColor: Colors.grey.shade200,
-                        valueColor: AlwaysStoppedAnimation(_scoreColor(val)),
+                )
+              : _videos.isEmpty
+                  ? _EmptyState(macAddress: widget.macAddress)
+                  : RefreshIndicator(
+                      color: AppColors.skyBlue,
+                      onRefresh: _loadVideoList,
+                      child: ListView(
+                        physics: const BouncingScrollPhysics(),
+                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                        children: [
+                          _HeaderStrip(
+                            macAddress: widget.macAddress,
+                            count: _videos.length,
+                          ),
+                          const SizedBox(height: 16),
+                          _SectionTitle(
+                              icon: Icons.history_rounded,
+                              text: 'Son Kayıtlar'),
+                          const SizedBox(height: 8),
+                          _VideoCarousel(
+                            videos: _videos,
+                            selected: _selected,
+                            onTap: _selectVideo,
+                          ),
+                          const SizedBox(height: 20),
+                          _SectionTitle(
+                              icon: Icons.play_circle_outline_rounded,
+                              text: 'Seçilen Doğrulama'),
+                          const SizedBox(height: 8),
+                          _VideoPlayerCard(
+                            controller: _videoController,
+                            initialized: _videoInitialized,
+                            errorMessage: _videoError,
+                          ),
+                          const SizedBox(height: 16),
+                          if (_loadingDetail)
+                            const Padding(
+                              padding: EdgeInsets.all(16),
+                              child: Center(
+                                  child: CircularProgressIndicator(
+                                      color: AppColors.skyBlue)),
+                            )
+                          else
+                            _MetadataCard(
+                              verification: _verification,
+                              video: _selected,
+                              macAddress: widget.macAddress,
+                            ),
+                          const SizedBox(height: 16),
+                          if (_selectedDocId != null)
+                            _DecisionBar(
+                              submitting: _submitting,
+                              onApprove: () => _submitDecision('approved'),
+                              onReject: () => _submitDecision('rejected'),
+                            ),
+                        ],
                       ),
                     ),
-                  ],
-                ),
-              );
-            }),
-          ],
-        ],
-      ),
     );
   }
+}
 
-  Color _scoreColor(double score) {
-    if (score >= 0.7) return Colors.green;
-    if (score >= 0.4) return Colors.orange;
-    return Colors.redAccent;
-  }
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-widgets
+// ─────────────────────────────────────────────────────────────────────────────
 
-  IconData _subScoreIcon(String key) {
-    switch (key) {
-      case 'pillDetection': return Icons.medication_rounded;
-      case 'mouthVerification': return Icons.face_rounded;
-      case 'presenceScore': return Icons.person_search_rounded;
-      case 'speedScore': return Icons.timer_rounded;
-      default: return Icons.analytics_rounded;
-    }
-  }
-
-  String _subScoreLabel(String key) {
-    switch (key) {
-      case 'pillDetection': return 'Pill Detection';
-      case 'mouthVerification': return 'Mouth Verification';
-      case 'presenceScore': return 'Presence Detection';
-      case 'speedScore': return 'Speed Score';
-      default:
-        return key.replaceAllMapped(RegExp(r'([a-z])([A-Z])'), (m) => '${m.group(1)} ${m.group(2)}');
-    }
-  }
-
-  Widget _buildPhaseIndicators() {
-    final Map<String, dynamic> subScores = Map<String, dynamic>.from(_verification?['subScores'] ?? {});
-    if (subScores.isEmpty) return const SizedBox.shrink();
-
-    final phases = [
-      _PhaseInfo('Pill Detection', 'pillDetection', Icons.medication_rounded),
-      _PhaseInfo('Tracking to Mouth', 'speedScore', Icons.trending_up_rounded),
-      _PhaseInfo('Mouth Verification', 'mouthVerification', Icons.face_rounded),
-      _PhaseInfo('Presence Check', 'presenceScore', Icons.person_search_rounded),
-    ];
-
-    final activePhases = phases.where((p) => subScores.containsKey(p.scoreKey)).toList();
-    if (activePhases.isEmpty) return const SizedBox.shrink();
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.blueGrey.shade50),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('Phase Status', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.deepSea)),
-          const SizedBox(height: 12),
-          ...activePhases.map((phase) {
-            final val = (subScores[phase.scoreKey] as num).toDouble();
-            final passed = val >= 0.5;
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(6),
-                    decoration: BoxDecoration(
-                      color: (passed ? Colors.green : Colors.redAccent).withOpacity(0.1),
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(
-                      passed ? Icons.check_rounded : Icons.close_rounded,
-                      color: passed ? Colors.green : Colors.redAccent,
-                      size: 16,
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(phase.label,
-                        style: TextStyle(
-                          fontSize: 14, fontWeight: FontWeight.w500,
-                          color: passed ? AppColors.deepSea : Colors.redAccent,
-                        )),
-                  ),
-                  Icon(phase.icon, size: 18, color: passed ? Colors.green : Colors.redAccent),
-                ],
-              ),
-            );
-          }),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDetailsPanel() {
-    final data = _verification!;
-    final section = data['sectionIndex'] ?? data['section'] ?? 0;
-    final hasDevice = data['hasDevice'] ?? false;
-    final presence = data['presenceDetected'] ?? false;
-    final timestamp = data['timestamp'] ?? '';
-
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.blueGrey.shade50),
-      ),
-      child: Column(
-        children: [
-          _detailRow(Icons.medication_rounded, 'Section', 'Section ${section.toString().replaceAll('.0', '')}'),
-          _divider(),
-          _detailRow(Icons.devices_rounded, 'With Device', hasDevice ? 'Yes' : 'No'),
-          _divider(),
-          _detailRow(Icons.person_rounded, 'Presence', presence ? 'Yes' : 'No'),
-          _divider(),
-          _detailRow(Icons.access_time_rounded, 'Timestamp', _formatTimestamp(timestamp)),
-        ],
-      ),
-    );
-  }
-
-  Widget _divider() => Divider(height: 1, color: Colors.blueGrey.shade50);
-
-  Widget _detailRow(IconData icon, String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: AppColors.skyBlue.withOpacity(0.1),
-              shape: BoxShape.circle,
-            ),
-            child: Icon(icon, color: AppColors.skyBlue, size: 18),
-          ),
-          const SizedBox(width: 12),
-          Text(label, style: TextStyle(color: Colors.grey.shade600, fontSize: 14, fontWeight: FontWeight.w500)),
-          const Spacer(),
-          Text(value, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppColors.deepSea)),
-        ],
-      ),
-    );
-  }
-
-  String _formatTimestamp(dynamic ts) {
-    try {
-      if (ts is String && ts.isNotEmpty) {
-        final dt = DateTime.parse(ts).toLocal();
-        return '${dt.day.toString().padLeft(2, '0')}.${dt.month.toString().padLeft(2, '0')}.${dt.year} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-      }
-      if (ts is Timestamp) {
-        final dt = ts.toDate().toLocal();
-        return '${dt.day.toString().padLeft(2, '0')}.${dt.month.toString().padLeft(2, '0')}.${dt.year} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-      }
-    } catch (_) {}
-    return '-';
-  }
-
-  Widget _buildActionButtons() {
-    final reviewDecision = _verification?['review_decision'];
-    if (reviewDecision != null) return const SizedBox.shrink();
-
-    final classification = _verification?['classification'] ?? '';
-    if (classification == 'success') return const SizedBox.shrink();
-
+class _SectionTitle extends StatelessWidget {
+  final IconData icon;
+  final String text;
+  const _SectionTitle({required this.icon, required this.text});
+  @override
+  Widget build(BuildContext context) {
     return Row(
       children: [
-        Expanded(
-          child: ElevatedButton.icon(
-            onPressed: _submitting ? null : () => _confirmAction('approved'),
-            icon: const Icon(Icons.check_circle_outline, size: 20),
-            label: _submitting
-                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                : const Text('Approve', style: TextStyle(fontWeight: FontWeight.bold)),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.turquoise,
-              foregroundColor: Colors.white,
-              elevation: 0,
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-            ),
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: ElevatedButton.icon(
-            onPressed: _submitting ? null : () => _confirmAction('denied'),
-            icon: const Icon(Icons.highlight_off_rounded, size: 20),
-            label: const Text('Deny', style: TextStyle(fontWeight: FontWeight.bold)),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.redAccent,
-              foregroundColor: Colors.white,
-              elevation: 0,
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-            ),
+        Icon(icon, color: AppColors.deepSea, size: 18),
+        const SizedBox(width: 8),
+        Text(
+          text,
+          style: GoogleFonts.inter(
+            fontSize: 15,
+            fontWeight: FontWeight.w800,
+            color: AppColors.deepSea,
           ),
         ),
       ],
     );
   }
+}
 
-  void _confirmAction(String decision) {
-    final isApprove = decision == 'approved';
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(isApprove ? 'Approve Verification?' : 'Deny Verification?'),
-        content: Text(isApprove
-            ? 'This will confirm the medication was taken correctly.'
-            : 'This will flag the verification as denied.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
+class _HeaderStrip extends StatelessWidget {
+  final String macAddress;
+  final int count;
+  const _HeaderStrip({required this.macAddress, required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [AppColors.skyBlue, AppColors.deepSea],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: AppColors.deepSea.withValues(alpha: 0.18),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
           ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              _submitDecision(decision);
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: isApprove ? AppColors.turquoise : Colors.redAccent,
-              foregroundColor: Colors.white,
+        ],
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.18),
+              borderRadius: BorderRadius.circular(14),
             ),
-            child: Text(isApprove ? 'Approve' : 'Deny'),
+            child: const Icon(Icons.medication_rounded,
+                color: Colors.white, size: 22),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Cihaz: $macAddress',
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '$count video kaydı bulundu',
+                  style: GoogleFonts.inter(
+                    fontSize: 11,
+                    color: Colors.white.withValues(alpha: 0.85),
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -692,9 +403,876 @@ class _RelativeReviewScreenState extends State<RelativeReviewScreen> {
   }
 }
 
-class _PhaseInfo {
-  final String label;
-  final String scoreKey;
+class _EmptyState extends StatelessWidget {
+  final String macAddress;
+  const _EmptyState({required this.macAddress});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 96,
+              height: 96,
+              decoration: BoxDecoration(
+                color: AppColors.skyBlue.withValues(alpha: 0.08),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.videocam_off_rounded,
+                  color: AppColors.skyBlue, size: 48),
+            ),
+            const SizedBox(height: 18),
+            Text(
+              'Henüz Video Yok',
+              style: GoogleFonts.inter(
+                fontSize: 18,
+                fontWeight: FontWeight.w800,
+                color: AppColors.deepSea,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Bu cihaz için henüz video doğrulama kaydı bulunmuyor.',
+              textAlign: TextAlign.center,
+              style: GoogleFonts.inter(
+                fontSize: 13,
+                color: const Color(0xFF475569),
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              macAddress,
+              style: GoogleFonts.inter(
+                fontSize: 11,
+                color: Colors.grey.shade500,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _VideoCarousel extends StatelessWidget {
+  final List<Map<String, dynamic>> videos;
+  final Map<String, dynamic>? selected;
+  final void Function(Map<String, dynamic>) onTap;
+  const _VideoCarousel({
+    required this.videos,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 116,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: videos.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 10),
+        itemBuilder: (ctx, i) {
+          final v = videos[i];
+          final isSel =
+              selected != null && selected!['fullPath'] == v['fullPath'];
+          final ts = _formatTimestamp(v['uploadedAt'] as String? ?? '');
+          final size = _formatBytes(v['sizeBytes'] as int? ?? 0);
+          return GestureDetector(
+            onTap: () => onTap(v),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
+              width: 158,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                gradient: isSel
+                    ? const LinearGradient(
+                        colors: [AppColors.skyBlue, AppColors.deepSea],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      )
+                    : null,
+                color: isSel ? null : AppColors.surface,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: isSel
+                      ? Colors.transparent
+                      : Colors.blueGrey.shade50,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: isSel
+                        ? AppColors.deepSea.withValues(alpha: 0.30)
+                        : Colors.black.withValues(alpha: 0.04),
+                    blurRadius: isSel ? 12 : 6,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: isSel
+                              ? Colors.white.withValues(alpha: 0.20)
+                              : AppColors.skyBlue.withValues(alpha: 0.10),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Icon(
+                          Icons.movie_creation_rounded,
+                          color: isSel ? Colors.white : AppColors.skyBlue,
+                          size: 16,
+                        ),
+                      ),
+                      const Spacer(),
+                      Text(
+                        '#${i + 1}',
+                        style: GoogleFonts.inter(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 12,
+                          color: isSel ? Colors.white : AppColors.deepSea,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const Spacer(),
+                  Text(
+                    ts.isEmpty ? 'Tarih ?' : ts,
+                    style: GoogleFonts.inter(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: isSel
+                          ? Colors.white
+                          : AppColors.deepSea,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    size,
+                    style: GoogleFonts.inter(
+                      fontSize: 10,
+                      color: isSel
+                          ? Colors.white.withValues(alpha: 0.8)
+                          : Colors.grey.shade600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  static String _formatTimestamp(String iso) {
+    if (iso.isEmpty) return '';
+    try {
+      final dt = DateTime.parse(iso).toLocal();
+      return DateFormat('dd MMM HH:mm', 'tr').format(dt);
+    } catch (_) {
+      return iso.length > 16 ? iso.substring(0, 16) : iso;
+    }
+  }
+
+  static String _formatBytes(int bytes) {
+    if (bytes <= 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    double v = bytes.toDouble();
+    int u = 0;
+    while (v >= 1024 && u < units.length - 1) {
+      v /= 1024;
+      u++;
+    }
+    return '${v.toStringAsFixed(v >= 10 ? 0 : 1)} ${units[u]}';
+  }
+}
+
+/// Video player with full custom controls (play/pause, scrub bar, fullscreen).
+class _VideoPlayerCard extends StatelessWidget {
+  final VideoPlayerController? controller;
+  final bool initialized;
+  final String? errorMessage;
+
+  const _VideoPlayerCard({
+    required this.controller,
+    required this.initialized,
+    required this.errorMessage,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // Use the actual video aspect ratio when initialized so the preview
+    // doesn't get stretched (recordings are typically 4:3 or 3:4, not 16:9).
+    // Fall back to 16:9 only while loading or on error.
+    final aspect = (initialized &&
+            controller != null &&
+            controller!.value.isInitialized &&
+            controller!.value.aspectRatio > 0)
+        ? controller!.value.aspectRatio
+        : 16 / 9;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.blueGrey.shade50),
+        boxShadow: [
+          BoxShadow(
+            color: AppColors.deepSea.withValues(alpha: 0.12),
+            blurRadius: 16,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        // Constrain max height so a tall portrait video doesn't push the rest
+        // of the page off-screen — we letterbox if needed.
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 360),
+          child: AspectRatio(
+            aspectRatio: aspect,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                if (errorMessage != null)
+                  Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.error_outline_rounded,
+                              color: Colors.white54, size: 36),
+                          const SizedBox(height: 8),
+                          Text(
+                            errorMessage!,
+                            style: GoogleFonts.inter(
+                                color: Colors.white70, fontSize: 13),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                else if (!initialized || controller == null)
+                  const CircularProgressIndicator(color: AppColors.skyBlue)
+                else
+                  _VideoSurface(controller: controller!),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _VideoSurface extends StatefulWidget {
+  final VideoPlayerController controller;
+  const _VideoSurface({required this.controller});
+
+  @override
+  State<_VideoSurface> createState() => _VideoSurfaceState();
+}
+
+class _VideoSurfaceState extends State<_VideoSurface> {
+  bool _showControls = true;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_onTick);
+  }
+
+  void _onTick() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onTick);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.controller;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => setState(() => _showControls = !_showControls),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          VideoPlayer(c),
+          if (_showControls || !c.value.isPlaying) ...[
+            Container(
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [Colors.black54, Colors.transparent, Colors.black54],
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  stops: [0.0, 0.45, 1.0],
+                ),
+              ),
+            ),
+            Center(
+              child: GestureDetector(
+                onTap: () => c.value.isPlaying ? c.pause() : c.play(),
+                child: Container(
+                  width: 64,
+                  height: 64,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.92),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    c.value.isPlaying
+                        ? Icons.pause_rounded
+                        : Icons.play_arrow_rounded,
+                    color: AppColors.deepSea,
+                    size: 36,
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 8,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Theme(
+                    data: ThemeData.dark(),
+                    child: VideoProgressIndicator(
+                      c,
+                      allowScrubbing: true,
+                      padding: const EdgeInsets.symmetric(vertical: 6),
+                      colors: const VideoProgressColors(
+                        playedColor: AppColors.skyBlue,
+                        bufferedColor: Colors.white24,
+                        backgroundColor: Colors.white10,
+                      ),
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      Text(
+                        _format(c.value.position),
+                        style: GoogleFonts.inter(
+                          fontSize: 11,
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        '/ ${_format(c.value.duration)}',
+                        style: GoogleFonts.inter(
+                          fontSize: 11,
+                          color: Colors.white70,
+                        ),
+                      ),
+                      const Spacer(),
+                      IconButton(
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        icon: Icon(
+                          c.value.volume > 0
+                              ? Icons.volume_up_rounded
+                              : Icons.volume_off_rounded,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                        onPressed: () =>
+                            c.setVolume(c.value.volume > 0 ? 0 : 1),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton(
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        icon: const Icon(Icons.fullscreen_rounded,
+                            color: Colors.white, size: 22),
+                        onPressed: () {
+                          Navigator.of(context).push(MaterialPageRoute(
+                            builder: (_) => _FullscreenVideoView(
+                              controller: c,
+                            ),
+                          ));
+                        },
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  static String _format(Duration d) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(d.inMinutes.remainder(60))}:${two(d.inSeconds.remainder(60))}';
+  }
+}
+
+class _FullscreenVideoView extends StatefulWidget {
+  final VideoPlayerController controller;
+  const _FullscreenVideoView({required this.controller});
+
+  @override
+  State<_FullscreenVideoView> createState() => _FullscreenVideoViewState();
+}
+
+class _FullscreenVideoViewState extends State<_FullscreenVideoView> {
+  @override
+  void initState() {
+    super.initState();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+      DeviceOrientation.portraitUp,
+    ]);
+  }
+
+  @override
+  void dispose() {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            Center(
+              child: AspectRatio(
+                aspectRatio: widget.controller.value.aspectRatio,
+                child: _VideoSurface(controller: widget.controller),
+              ),
+            ),
+            Positioned(
+              top: 12,
+              left: 12,
+              child: IconButton(
+                icon: const Icon(Icons.close_rounded,
+                    color: Colors.white, size: 28),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MetadataCard extends StatelessWidget {
+  final Map<String, dynamic>? verification;
+  final Map<String, dynamic>? video;
+  final String macAddress;
+
+  const _MetadataCard({
+    required this.verification,
+    required this.video,
+    required this.macAddress,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final v = verification;
+    final score = (v?['accuracyScore'] as num?)?.toDouble();
+    final classification = v?['classification'] as String? ?? 'unknown';
+    final ts = v?['timestamp'];
+    final timeStr = ts is Timestamp
+        ? DateFormat('dd MMM yyyy, HH:mm', 'tr').format(ts.toDate())
+        : '';
+    final section = v?['sectionIndex'] as int?;
+    final review = v?['review_decision'] as String?;
+    final detectionConfirmed = v?['detectionConfirmed'] as bool?;
+    final userConfirmed = v?['userConfirmed'] as bool?;
+    final highestPhase = v?['highestPhase'] as String?;
+
+    Color classColor;
+    IconData classIcon;
+    String classLabel;
+    switch (classification) {
+      case 'success':
+        classColor = AppColors.turquoise;
+        classIcon = Icons.verified_rounded;
+        classLabel = 'BAŞARILI';
+        break;
+      case 'suspicious':
+        classColor = Colors.orange;
+        classIcon = Icons.help_outline_rounded;
+        classLabel = 'ŞÜPHELİ';
+        break;
+      case 'rejected':
+        classColor = Colors.redAccent;
+        classIcon = Icons.cancel_rounded;
+        classLabel = 'REDDEDİLDİ';
+        break;
+      default:
+        classColor = Colors.grey;
+        classIcon = Icons.info_outline_rounded;
+        classLabel = 'BİLİNMİYOR';
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.blueGrey.shade50),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.04),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: classColor.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(classIcon, color: classColor, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      classLabel,
+                      style: GoogleFonts.inter(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w800,
+                        color: classColor,
+                        letterSpacing: 0.6,
+                      ),
+                    ),
+                    if (timeStr.isNotEmpty)
+                      Text(
+                        timeStr,
+                        style: GoogleFonts.inter(
+                          fontSize: 11,
+                          color: Colors.grey.shade600,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              if (score != null)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [
+                        classColor.withValues(alpha: 0.18),
+                        classColor.withValues(alpha: 0.08),
+                      ],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                    borderRadius: BorderRadius.circular(20),
+                    border:
+                        Border.all(color: classColor.withValues(alpha: 0.3)),
+                  ),
+                  child: Text(
+                    '${(score * 100).toStringAsFixed(0)}%',
+                    style: GoogleFonts.inter(
+                      fontWeight: FontWeight.w900,
+                      color: classColor,
+                      fontSize: 16,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          if (v == null)
+            Text(
+              'Bu video icin meta veri bulunamadi.',
+              style: GoogleFonts.inter(
+                fontSize: 12,
+                color: Colors.grey.shade600,
+                fontStyle: FontStyle.italic,
+              ),
+            )
+          else
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                if (section != null)
+                  _Chip(
+                    icon: Icons.layers_rounded,
+                    label: 'Bolme',
+                    value: '$section',
+                    color: AppColors.skyBlue,
+                  ),
+                if (detectionConfirmed != null)
+                  _Chip(
+                    icon: Icons.visibility_rounded,
+                    label: 'Gorsel',
+                    value: detectionConfirmed ? 'Evet' : 'Hayir',
+                    color: detectionConfirmed
+                        ? AppColors.turquoise
+                        : Colors.orange,
+                  ),
+                if (userConfirmed != null)
+                  _Chip(
+                    icon: Icons.person_rounded,
+                    label: 'Onay',
+                    value: userConfirmed ? 'Evet' : 'Hayir',
+                    color: userConfirmed
+                        ? AppColors.turquoise
+                        : Colors.redAccent,
+                  ),
+                if (highestPhase != null)
+                  _Chip(
+                    icon: Icons.show_chart_rounded,
+                    label: 'En Yuksek Faz',
+                    value: _humanizePhase(highestPhase),
+                    color: AppColors.deepSea,
+                  ),
+              ],
+            ),
+          if (review != null) ...[
+            const Divider(height: 24),
+            Row(
+              children: [
+                Icon(
+                  review == 'approved'
+                      ? Icons.thumb_up_alt_rounded
+                      : Icons.thumb_down_alt_rounded,
+                  color: review == 'approved'
+                      ? AppColors.turquoise
+                      : Colors.redAccent,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'Yakin karari: ',
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    color: Colors.grey.shade700,
+                  ),
+                ),
+                Text(
+                  review == 'approved' ? 'Onaylandi' : 'Reddedildi',
+                  style: GoogleFonts.inter(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: review == 'approved'
+                        ? AppColors.turquoise
+                        : Colors.redAccent,
+                  ),
+                ),
+              ],
+            ),
+          ],
+          const SizedBox(height: 12),
+          Text(
+            macAddress,
+            style: GoogleFonts.inter(
+              fontSize: 10,
+              color: Colors.grey.shade400,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static String _humanizePhase(String name) {
+    const map = {
+      'noFace': 'Yuz Yok',
+      'faceDetected': 'Yuz Algilandi',
+      'mouthOpen': 'Agiz Acik',
+      'pillOnTongue': 'Hap Dilde',
+      'mouthClosedWithPill': 'Agiz Kapandi',
+      'drinking': 'Su Iciliyor',
+      'mouthReopened': 'Agiz Tekrar Acildi',
+      'swallowConfirmed': 'Yutma Onaylandi',
+      'swallowFailed': 'Yutma Basarisiz',
+      'timeoutExpired': 'Sure Doldu',
+    };
+    return map[name] ?? name;
+  }
+}
+
+class _Chip extends StatelessWidget {
   final IconData icon;
-  const _PhaseInfo(this.label, this.scoreKey, this.icon);
+  final String label;
+  final String value;
+  final Color color;
+  const _Chip({
+    required this.icon,
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: color, size: 14),
+          const SizedBox(width: 6),
+          Text(
+            '$label: ',
+            style: GoogleFonts.inter(
+              fontSize: 11,
+              color: color,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          Text(
+            value,
+            style: GoogleFonts.inter(
+              fontSize: 11,
+              fontWeight: FontWeight.w800,
+              color: AppColors.deepSea,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DecisionBar extends StatelessWidget {
+  final bool submitting;
+  final VoidCallback onApprove;
+  final VoidCallback onReject;
+
+  const _DecisionBar({
+    required this.submitting,
+    required this.onApprove,
+    required this.onReject,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: _GradientButton(
+            label: 'Reddet',
+            icon: Icons.thumb_down_alt_rounded,
+            colors: const [Color(0xFFE53935), Color(0xFFB71C1C)],
+            onPressed: submitting ? null : onReject,
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          flex: 2,
+          child: _GradientButton(
+            label: 'Onayla',
+            icon: Icons.thumb_up_alt_rounded,
+            colors: const [AppColors.turquoise, Color(0xFF1B998B)],
+            onPressed: submitting ? null : onApprove,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _GradientButton extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final List<Color> colors;
+  final VoidCallback? onPressed;
+
+  const _GradientButton({
+    required this.label,
+    required this.icon,
+    required this.colors,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final disabled = onPressed == null;
+    return Opacity(
+      opacity: disabled ? 0.5 : 1.0,
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(14),
+          gradient: LinearGradient(
+            colors: colors,
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: colors.last.withValues(alpha: 0.3),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: onPressed,
+            borderRadius: BorderRadius.circular(14),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(icon, color: Colors.white, size: 18),
+                  const SizedBox(width: 8),
+                  Text(
+                    label,
+                    style: GoogleFonts.inter(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w800,
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }

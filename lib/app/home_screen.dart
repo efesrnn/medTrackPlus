@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:medTrackPlus/widgets/circular_selector.dart';
 import 'package:medTrackPlus/services/database_service.dart';
 import 'package:medTrackPlus/main.dart';
+import 'package:medTrackPlus/beta/verification_screen/verification_screen.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -467,27 +468,83 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   Widget _buildQuickActionButtons() {
-    return Row(
+    return Column(
       children: [
-        if (_currentRole == DeviceRole.owner)
-          Expanded(
-            child: _buildSmallActionButton(
-              icon: Icons.manage_accounts_rounded,
-              label: "access_management".tr(),
-              color: AppColors.skyBlue,
-              onTap: _showUserManagementDialog,
+        Row(
+          children: [
+            if (_currentRole == DeviceRole.owner)
+              Expanded(
+                child: _buildSmallActionButton(
+                  icon: Icons.manage_accounts_rounded,
+                  label: "access_management".tr(),
+                  color: AppColors.skyBlue,
+                  onTap: _showUserManagementDialog,
+                ),
+              ),
+            if (_currentRole == DeviceRole.owner) const SizedBox(width: 10),
+            Expanded(
+              child: _buildSmallActionButton(
+                icon: Icons.alarm_rounded,
+                label: "alarm_settings".tr(),
+                color: AppColors.deepSea,
+                onTap: _showNotificationSettingsDialog,
+              ),
             ),
-          ),
-        if (_currentRole == DeviceRole.owner) const SizedBox(width: 10),
-        Expanded(
+          ],
+        ),
+        const SizedBox(height: 10),
+        // ─── DEV: Mock Alarm ────────────────────────────────────────────
+        // Doğrudan VerificationScreen'i tetikler — gerçek alarm/sistem
+        // entegrasyonu olmadan video doğrulama akışını test etmek için.
+        SizedBox(
+          width: double.infinity,
           child: _buildSmallActionButton(
-            icon: Icons.alarm_rounded,
-            label: "alarm_settings".tr(),
-            color: AppColors.deepSea,
-            onTap: _showNotificationSettingsDialog,
+            icon: Icons.bug_report_rounded,
+            label: 'Mock Alarm (Dev) — İlaç Doğrulamayı Aç',
+            color: Colors.deepOrange,
+            onTap: _handleMockAlarm,
           ),
         ),
       ],
+    );
+  }
+
+  /// DEV: bypass the real alarm system and jump straight into the unified
+  /// medication verification screen. Lets you test the camera + recording
+  /// flow without setting an actual alarm time.
+  Future<void> _handleMockAlarm() async {
+    final sectionIndex = await showDialog<int>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Mock Alarm — Bölme Seç'),
+        children: List.generate(_sections.isEmpty ? 1 : _sections.length,
+            (i) {
+          final name = _sections.length > i
+              ? (_sections[i]['name']?.toString() ??
+                  'Bölme ${i + 1}')
+              : 'Bölme ${i + 1}';
+          return SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, i),
+            child: Row(
+              children: [
+                const Icon(Icons.medication, color: Colors.deepOrange),
+                const SizedBox(width: 12),
+                Text('$name (#$i)'),
+              ],
+            ),
+          );
+        }),
+      ),
+    );
+    if (sectionIndex == null) return;
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => VerificationScreen(
+          sectionIndex: sectionIndex,
+          macAddress: widget.macAddress,
+        ),
+      ),
     );
   }
 

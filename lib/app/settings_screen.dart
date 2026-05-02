@@ -1,12 +1,13 @@
 import 'package:medTrackPlus/services/auth_service.dart';
+import 'package:medTrackPlus/services/consent_service.dart';
 import 'package:medTrackPlus/services/database_service.dart';
 import 'package:easy_localization/easy_localization.dart';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:medTrackPlus/main.dart'; // AppColors
 import 'package:medTrackPlus/app/developer_screen.dart';
 import 'package:medTrackPlus/app/reports_screen.dart'; // Rapor ekranı
+import 'package:medTrackPlus/widgets/kvkk_consent_dialog.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -23,10 +24,52 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<Map<String, String>> _activeFeedbackDevices = [];
   bool _isLoadingDevices = true;
 
+  // Video Doğrulama (KVKK) consent state
+  bool _videoConsent = false;
+  bool _videoConsentLoaded = false;
+
   @override
   void initState() {
     super.initState();
     _fetchAndFilterDevices();
+    _loadVideoConsent();
+  }
+
+  Future<void> _loadVideoConsent() async {
+    final granted = await ConsentService.isVideoConsentEnabled();
+    if (mounted) {
+      setState(() {
+        _videoConsent = granted;
+        _videoConsentLoaded = true;
+      });
+    }
+  }
+
+  Future<void> _onVideoConsentToggle(bool desired) async {
+    if (desired) {
+      // Kullanıcı açmaya çalışıyor → KVKK dialog'u göster
+      final accepted = await KvkkConsentDialog.show(context);
+      if (!mounted) return;
+      if (accepted) {
+        await ConsentService.grantVideoConsent();
+        if (!mounted) return;
+        setState(() => _videoConsent = true);
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Video doğrulama kaydı etkinleştirildi.'),
+          duration: Duration(seconds: 2),
+        ));
+      }
+      // Reddedildiyse hiçbir şey yapma — toggle kapalı kalır
+    } else {
+      // Kullanıcı kapatıyor → onay isteme, direkt revoke
+      await ConsentService.revokeVideoConsent();
+      if (!mounted) return;
+      setState(() => _videoConsent = false);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Video doğrulama kaydı devre dışı bırakıldı.'),
+        duration: Duration(seconds: 2),
+      ));
+    }
   }
 
   // Cihazları çek ve sadece feedback açık olanları filtrele
@@ -106,6 +149,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
               MaterialPageRoute(builder: (_) => const DeveloperScreen()),
             ),
           ),
+
+          const Divider(),
+
+          // Video Doğrulama Kaydı (KVKK)
+          SwitchListTile(
+            secondary: const Icon(Icons.videocam_rounded,
+                color: AppColors.deepSea),
+            title: const Text(
+              'Video Doğrulama Kaydı',
+              style: TextStyle(fontWeight: FontWeight.w600),
+            ),
+            subtitle: Text(
+              _videoConsent
+                  ? 'Aktif — ilaç alımı sırasında kısa video kaydedilebilir.'
+                  : 'Kapalı — kayıt yapılmaz, sadece görsel doğrulama çalışır.',
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+            ),
+            value: _videoConsent,
+            activeColor: AppColors.skyBlue,
+            onChanged: _videoConsentLoaded ? _onVideoConsentToggle : null,
+          ),
+          if (_videoConsent)
+            Padding(
+              padding: const EdgeInsets.only(left: 72, right: 16, bottom: 8),
+              child: Text(
+                'Videolar Firebase\'de en fazla 24 saat saklanır, sonra otomatik silinir. Hasta yakınlarınız "Yakın İncelemesi" ekranından erişebilir.',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Colors.grey.shade500,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
 
           const Divider(),
 

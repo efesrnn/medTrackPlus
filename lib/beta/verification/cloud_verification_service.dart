@@ -5,9 +5,27 @@ import 'package:flutter/foundation.dart';
 import 'package:medTrackPlus/beta/core/interfaces/i_cloud_verification_service.dart';
 import 'package:medTrackPlus/beta/models/verification_result.dart';
 
+/// Result of a video upload — caller may need both the URL (for immediate
+/// playback) and the storage path (so it can be deleted if the user later
+/// rejects the recording in the "no, couldn't take it" flow).
+class VideoUploadResult {
+  final String downloadUrl;
+  final String storagePath;
+  const VideoUploadResult({
+    required this.downloadUrl,
+    required this.storagePath,
+  });
+}
+
 /// Concrete implementation of [ICloudVerificationService].
-/// Handles saving verification results to Firestore and
-/// uploading footage clips to Firebase Storage.
+///
+/// Storage scheme:
+///   videos/{deviceId}/{ISO8601-timestamp}.mp4
+///
+/// Firestore scheme:
+///   users/{uid}/verifications/{verificationId}                — per-user log
+///   dispenser/{macAddress}/verifications/{verificationId}     — per-device log
+///                                                              (relatives query this)
 class CloudVerificationService implements ICloudVerificationService {
   final FirebaseFirestore _firestore;
   final FirebaseStorage _storage;
@@ -35,37 +53,146 @@ class CloudVerificationService implements ICloudVerificationService {
     }
   }
 
+  /// Saves a verification under the device document so relatives can review it.
+  /// Pass [extraData] (e.g. {'storagePath': ...}) for fields not modeled by
+  /// [VerificationResult].
+  Future<void> saveForDevice({
+    required String macAddress,
+    required VerificationResult result,
+    Map<String, dynamic>? extraData,
+  }) async {
+    try {
+      final data = {
+        ...result.toFirestore(),
+        if (extraData != null) ...extraData,
+      };
+      await _firestore
+          .collection('dispenser')
+          .doc(macAddress)
+          .collection('verifications')
+          .doc(result.id)
+          .set(data);
+      debugPrint(
+          '[CloudVerificationService] Saved device verification ${result.id} for $macAddress');
+    } catch (e) {
+      debugPrint('[CloudVerificationService] saveForDevice error: $e');
+      rethrow;
+    }
+  }
+
+  /// Legacy single-arg upload — kept for backwards compatibility.
+  /// Prefer [uploadVideo] which uses the new videos/{deviceId}/ scheme.
   @override
   Future<String> upload(String userId, String localPath) async {
+    final result = await uploadVideo(deviceId: userId, localPath: localPath);
+    return result.downloadUrl;
+  }
+
+  /// Uploads an MP4 video to `videos/{deviceId}/{ISO timestamp}.mp4`.
+  /// Returns both the download URL and the storage path for later deletion.
+  ///
+  /// [onProgress] is invoked with values in [0.0, 1.0] as bytes upload.
+  Future<VideoUploadResult> uploadVideo({
+    required String deviceId,
+    required String localPath,
+    String? customTimestamp,
+    void Function(double progress)? onProgress,
+  }) async {
     try {
       final file = File(localPath);
       if (!await file.exists()) {
-        throw Exception('File not found: $localPath');
+        throw Exception('Video file not found: $localPath');
       }
 
-      final fileName =
-          'verifications/$userId/${DateTime.now().millisecondsSinceEpoch}.raw';
-      final ref = _storage.ref().child(fileName);
+      final ts = customTimestamp ??
+          DateTime.now().toUtc().toIso8601String().replaceAll(':', '-');
+      final storagePath = 'videos/$deviceId/$ts.mp4';
+      final ref = _storage.ref().child(storagePath);
 
       final uploadTask = ref.putFile(
         file,
-        SettableMetadata(contentType: 'application/octet-stream'),
+        SettableMetadata(
+          contentType: 'video/mp4',
+          customMetadata: {
+            'deviceId': deviceId,
+            'uploadedAt': DateTime.now().toUtc().toIso8601String(),
+            // Cleanup function uses this to compute TTL even if mtime is wrong.
+            'expiresAt': DateTime.now()
+                .toUtc()
+                .add(const Duration(hours: 24))
+                .toIso8601String(),
+          },
+        ),
       );
 
       uploadTask.snapshotEvents.listen((snapshot) {
-        final progress = snapshot.bytesTransferred / snapshot.totalBytes;
-        debugPrint(
-            '[CloudVerificationService] Upload progress: ${(progress * 100).toStringAsFixed(0)}%');
+        if (snapshot.totalBytes > 0) {
+          final progress = snapshot.bytesTransferred / snapshot.totalBytes;
+          if (onProgress != null) onProgress(progress.clamp(0.0, 1.0));
+          debugPrint(
+              '[CloudVerificationService] Upload: ${(progress * 100).toStringAsFixed(0)}%');
+        }
       });
 
       await uploadTask;
+      if (onProgress != null) onProgress(1.0);
       final downloadUrl = await ref.getDownloadURL();
 
-      debugPrint('[CloudVerificationService] Upload complete: $downloadUrl');
-      return downloadUrl;
+      debugPrint(
+          '[CloudVerificationService] Video uploaded: $storagePath');
+      return VideoUploadResult(
+        downloadUrl: downloadUrl,
+        storagePath: storagePath,
+      );
     } catch (e) {
-      debugPrint('[CloudVerificationService] Upload error: $e');
+      debugPrint('[CloudVerificationService] uploadVideo error: $e');
       rethrow;
+    }
+  }
+
+  /// Deletes a previously uploaded video by its full storage path
+  /// (e.g. "videos/AABBCC/2026-...-..mp4"). Used when the user says they
+  /// couldn't take the medication in the timeout dialog.
+  Future<void> deleteVideo(String storagePath) async {
+    try {
+      await _storage.ref().child(storagePath).delete();
+      debugPrint('[CloudVerificationService] Deleted $storagePath');
+    } catch (e) {
+      debugPrint('[CloudVerificationService] deleteVideo error: $e');
+      // Don't rethrow — deletion failure shouldn't break the flow
+    }
+  }
+
+  /// Lists all videos for a device, newest first.
+  /// Returns list of {name, fullPath, downloadUrl, uploadedAt}.
+  Future<List<Map<String, dynamic>>> listVideos(String deviceId) async {
+    try {
+      final result = await _storage.ref().child('videos/$deviceId').listAll();
+      final entries = <Map<String, dynamic>>[];
+      for (final item in result.items) {
+        try {
+          final meta = await item.getMetadata();
+          final url = await item.getDownloadURL();
+          entries.add({
+            'name': item.name,
+            'fullPath': item.fullPath,
+            'downloadUrl': url,
+            'uploadedAt': meta.customMetadata?['uploadedAt'] ??
+                meta.timeCreated?.toIso8601String() ??
+                '',
+            'sizeBytes': meta.size ?? 0,
+          });
+        } catch (e) {
+          debugPrint('[CloudVerificationService] listVideos item error: $e');
+        }
+      }
+      // Newest first
+      entries.sort((a, b) =>
+          (b['uploadedAt'] as String).compareTo(a['uploadedAt'] as String));
+      return entries;
+    } catch (e) {
+      debugPrint('[CloudVerificationService] listVideos error: $e');
+      return [];
     }
   }
 
