@@ -1,5 +1,9 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter_quick_video_encoder/flutter_quick_video_encoder.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'package:camera/camera.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -61,11 +65,53 @@ class _VerificationScreenState extends State<VerificationScreen> {
   String? _recordedLocalPath;
   Timer? _recordingTimeoutTimer;
   DateTime? _recordingStartedAt;
-  static const Duration _recordingMaxDuration = Duration(seconds: 15);
+  static const Duration _recordingMaxDuration = Duration(seconds: 30);
+
+  // ── Software video encoder (replaces controller.startVideoRecording) ─────
+  // We never call MediaRecorder. Instead, when "recording" is on we forward
+  // every Nth frame from the imageStream into FlutterQuickVideoEncoder. This
+  // way detection never pauses (no Camera2 surface conflict) AND a real MP4
+  // is built from the EXACT frames detection sees.
+  bool _encoderActive = false;
+  bool _encoderBusy = false;
+  bool _encoderConfigured = false;
+  int _encodedFrameCount = 0;
+  DateTime? _lastEncodedFrameAt;
+  // Output 10 fps → file size manageable, plenty for review.
+  static const Duration _encoderFrameInterval =
+      Duration(milliseconds: 100);
+  String? _encoderOutputPath;
+  int _encoderWidth = 0;
+  int _encoderHeight = 0;
+  // Source buffer dimensions (BEFORE rotation) — needed for the rotated
+  // copy step inside _encodeFrame.
+  int _srcWidth = 0;
+  int _srcHeight = 0;
+  // 0/90/180/270 — rotation applied during encoding so the saved MP4 is
+  // portrait, matching how the user holds the phone.
+  int _encoderRotationDeg = 0;
+  // Set true the moment DetectionPhase.swallowConfirmed fires. We do NOT
+  // stop recording at that moment — the recording always runs for the full
+  // _recordingMaxDuration so reviewers see the entire 30-second process.
+  bool _detectionSucceeded = false;
+  // True once _onTimeout has begun finalizing (stopRecording / saveAndUpload).
+  // Blocks the mouth-open trigger from spawning a SECOND _startRecording
+  // during the brief window before _completed gets set. Without this guard
+  // the second encoder reopens the SAME .mp4 path while video_compress is
+  // still reading from it, which crashes the MediaMetadataRetriever inside
+  // video_compress (setDataSource fails with -22).
+  bool _finalizing = false;
 
   bool _uploading = false;
   double _uploadProgress = 0.0;
   String _uploadStatus = '';
+
+  // Result info shown in the centered completion modal:
+  String? _completionFootageUrl;
+  String? _completionStoragePath;
+  String? _completionUploadError;
+  double _completionScore = 0.0;
+  String _completionClassification = 'unknown';
 
   final String _sessionId = const Uuid().v4();
   bool _videoUploaded = false;
@@ -162,18 +208,34 @@ class _VerificationScreenState extends State<VerificationScreen> {
       if (result.phase.index > _highestPhaseReached.index) {
         _highestPhaseReached = result.phase;
       }
-      // Trigger recording only AFTER the pill is confirmed on the tongue —
-      // this guarantees the recording captures a meaningful moment (pill
-      // placement → mouth close → drink → swallow), not just an empty
-      // open mouth.
+      // Trigger recording the moment the user opens their mouth — so the
+      // entire interaction (pill placement → consumption → swallow) is
+      // captured on video for the relative reviewer.
       if (!_recording &&
           !_videoUploaded &&
+          !_finalizing &&
+          !_completed &&
           _consentEnabled &&
-          result.phase == DetectionPhase.pillOnTongue) {
-        _startRecording();
+          result.phase == DetectionPhase.mouthOpen) {
+        // Pass the current frame so the encoder uses the SAME width/height
+        // as the buffers we'll feed it (preview size and stream buffer size
+        // can differ on some devices, causing SIZE MISMATCH errors).
+        _startRecording(image);
       }
-      if (result.phase == DetectionPhase.swallowConfirmed && !_completed) {
-        _finalizeSuccess();
+      // Detection success: stop recording IMMEDIATELY and finalize.
+      // Continuing to record after the verification completes (a) is wasteful,
+      // (b) dilutes the score because post-swallow frames have no pill on
+      // tongue. The 30s timer remains as a fallback for cases where
+      // swallowConfirmed never arrives.
+      if (result.phase == DetectionPhase.swallowConfirmed &&
+          !_detectionSucceeded &&
+          !_finalizing) {
+        _detectionSucceeded = true;
+        if (mounted) {
+          setState(() => _statusMessage = 'Yutma onaylandı — kayıt sonlanıyor...');
+        }
+        // Fire and forget — _onTimeout will set _finalizing & block re-entry.
+        _onTimeout();
       }
       if (mounted) {
         setState(() {
@@ -181,11 +243,211 @@ class _VerificationScreenState extends State<VerificationScreen> {
           _imageSize = Size(image.width.toDouble(), image.height.toDouble());
         });
       }
+      // Feed the encoder from the very same imageStream that detection uses.
+      // Throttled to ~10 fps. No call to MediaRecorder anywhere — this
+      // sidesteps the Android Camera2 single-recording-surface limitation.
+      if (_encoderActive) {
+        if (_encoderBusy) {
+          // Skipped: previous encode still in flight
+        } else {
+          final now = DateTime.now();
+          if (_lastEncodedFrameAt == null ||
+              now.difference(_lastEncodedFrameAt!) >= _encoderFrameInterval) {
+            _lastEncodedFrameAt = now;
+            _encoderBusy = true;
+            // Await here — converting + sending RGBA must finish before the
+            // next imageStream frame replaces this CameraImage's buffer.
+            try {
+              await _encodeFrame(image);
+            } finally {
+              _encoderBusy = false;
+            }
+          }
+        }
+      }
     } catch (e) {
       debugPrint('[VerificationScreen] Detection error: $e');
     } finally {
       _isProcessing = false;
     }
+  }
+
+  /// NV21 → RGBA conversion + append to encoder. Runs ~10 Hz.
+  Future<void> _encodeFrame(CameraImage image) async {
+    if (!_encoderConfigured) {
+      debugPrint('[VerificationScreen] encode skipped: !_encoderConfigured');
+      return;
+    }
+    try {
+      final srcRgba = _nv21ToRgba(image);
+      if (srcRgba == null) {
+        debugPrint(
+            '[VerificationScreen] encode skipped: _nv21ToRgba returned null '
+            '(planes=${image.planes.length}, w=${image.width}, h=${image.height})');
+        return;
+      }
+      // Rotate src landscape RGBA → portrait RGBA so the saved MP4 plays in
+      // the correct orientation. rotation = _encoderRotationDeg (0/90/180/270).
+      final rgba = _rotateRgba(
+          srcRgba, image.width, image.height, _encoderRotationDeg);
+      // Sanity-check: encoder requires EXACTLY width*height*4 RGBA bytes.
+      final expected = _encoderWidth * _encoderHeight * 4;
+      if (rgba.length != expected) {
+        debugPrint(
+            '[VerificationScreen] encode SIZE MISMATCH: rgba.length=${rgba.length} '
+            'expected=$expected (encW=$_encoderWidth, encH=$_encoderHeight, '
+            'rot=$_encoderRotationDeg°, '
+            'imgW=${image.width}, imgH=${image.height})');
+        return;
+      }
+      await FlutterQuickVideoEncoder.appendVideoFrame(rgba);
+      _encodedFrameCount++;
+      if (_encodedFrameCount == 1 || _encodedFrameCount % 30 == 0) {
+        debugPrint(
+            '[VerificationScreen] encoded frames so far: $_encodedFrameCount');
+      }
+    } catch (e, st) {
+      debugPrint('[VerificationScreen] encoder append FAILED: $e\n$st');
+    }
+  }
+
+  /// Quick NV21 → RGBA converter. The CameraImage may arrive in two layouts:
+  ///   • 2+ planes: planes[0]=Y, planes[1]=interleaved VU (standard)
+  ///   • 1 plane: single buffer = [Y (W*H bytes)] + [VU (W*H/2 bytes)]
+  ///     (Samsung Exynos / some Camera2 HAL implementations do this)
+  /// We handle both. RGBA size matches encoder's configured width × height.
+  Uint8List? _nv21ToRgba(CameraImage image) {
+    if (image.planes.isEmpty) return null;
+    final w = image.width;
+    final h = image.height;
+    final out = Uint8List(w * h * 4);
+
+    if (image.planes.length >= 2) {
+      // Two-plane layout (standard NV21 / YUV_420_888 semi-planar)
+      final yBytes = image.planes[0].bytes;
+      final uvBytes = image.planes[1].bytes;
+      final yRowStride = image.planes[0].bytesPerRow;
+      final uvRowStride = image.planes[1].bytesPerRow;
+      int dstIdx = 0;
+      for (int y = 0; y < h; y++) {
+        final yRowStart = y * yRowStride;
+        final uvRowStart = (y >> 1) * uvRowStride;
+        for (int x = 0; x < w; x++) {
+          final yVal = yBytes[yRowStart + x] & 0xFF;
+          final uvOffset = (x >> 1) * 2;
+          final v = (uvBytes[uvRowStart + uvOffset] & 0xFF) - 128;
+          final u = (uvBytes[uvRowStart + uvOffset + 1] & 0xFF) - 128;
+          int r = yVal + ((359 * v) >> 8);
+          int g = yVal - ((88 * u + 183 * v) >> 8);
+          int b = yVal + ((454 * u) >> 8);
+          if (r < 0) r = 0; else if (r > 255) r = 255;
+          if (g < 0) g = 0; else if (g > 255) g = 255;
+          if (b < 0) b = 0; else if (b > 255) b = 255;
+          out[dstIdx++] = r;
+          out[dstIdx++] = g;
+          out[dstIdx++] = b;
+          out[dstIdx++] = 255;
+        }
+      }
+      return out;
+    }
+
+    // Single-plane NV21: contiguous Y then VU interleaved.
+    final bytes = image.planes[0].bytes;
+    final yRowStride = image.planes[0].bytesPerRow > 0
+        ? image.planes[0].bytesPerRow
+        : w;
+    final yPlaneSize = yRowStride * h;
+    final uvRowStride = yRowStride; // interleaved VU has same row stride
+    if (bytes.length < yPlaneSize) return null; // incomplete buffer
+    int dstIdx = 0;
+    for (int y = 0; y < h; y++) {
+      final yRowStart = y * yRowStride;
+      final uvRowStart = yPlaneSize + (y >> 1) * uvRowStride;
+      for (int x = 0; x < w; x++) {
+        final yVal = bytes[yRowStart + x] & 0xFF;
+        final uvOffset = (x >> 1) * 2;
+        final vIdx = uvRowStart + uvOffset;
+        final uIdx = vIdx + 1;
+        // Defensive bounds check (some packed buffers may be slightly short)
+        if (uIdx >= bytes.length) {
+          out[dstIdx++] = yVal; // grayscale fallback
+          out[dstIdx++] = yVal;
+          out[dstIdx++] = yVal;
+          out[dstIdx++] = 255;
+          continue;
+        }
+        final v = (bytes[vIdx] & 0xFF) - 128;
+        final u = (bytes[uIdx] & 0xFF) - 128;
+        int r = yVal + ((359 * v) >> 8);
+        int g = yVal - ((88 * u + 183 * v) >> 8);
+        int b = yVal + ((454 * u) >> 8);
+        if (r < 0) r = 0; else if (r > 255) r = 255;
+        if (g < 0) g = 0; else if (g > 255) g = 255;
+        if (b < 0) b = 0; else if (b > 255) b = 255;
+        out[dstIdx++] = r;
+        out[dstIdx++] = g;
+        out[dstIdx++] = b;
+        out[dstIdx++] = 255;
+      }
+    }
+    return out;
+  }
+
+  /// Rotates an RGBA buffer by `rotDeg` (0/90/180/270) clockwise.
+  /// For 90/270, output dimensions are swapped (srcH × srcW instead of
+  /// srcW × srcH). Returns the input untouched if rotDeg == 0.
+  Uint8List _rotateRgba(Uint8List src, int srcW, int srcH, int rotDeg) {
+    if (rotDeg == 0) return src;
+    final dst = Uint8List(src.length);
+    if (rotDeg == 90) {
+      // Out dims: srcH × srcW. Mapping: dst[ox, oy] = src[oy, srcH-1-ox].
+      final outW = srcH;
+      final outH = srcW;
+      for (int oy = 0; oy < outH; oy++) {
+        for (int ox = 0; ox < outW; ox++) {
+          final sx = oy;
+          final sy = srcH - 1 - ox;
+          final si = (sy * srcW + sx) * 4;
+          final di = (oy * outW + ox) * 4;
+          dst[di] = src[si];
+          dst[di + 1] = src[si + 1];
+          dst[di + 2] = src[si + 2];
+          dst[di + 3] = 255;
+        }
+      }
+    } else if (rotDeg == 180) {
+      for (int oy = 0; oy < srcH; oy++) {
+        for (int ox = 0; ox < srcW; ox++) {
+          final sx = srcW - 1 - ox;
+          final sy = srcH - 1 - oy;
+          final si = (sy * srcW + sx) * 4;
+          final di = (oy * srcW + ox) * 4;
+          dst[di] = src[si];
+          dst[di + 1] = src[si + 1];
+          dst[di + 2] = src[si + 2];
+          dst[di + 3] = 255;
+        }
+      }
+    } else {
+      // 270° CW. Out dims: srcH × srcW.
+      // Mapping: dst[ox, oy] = src[srcW-1-oy, ox].
+      final outW = srcH;
+      final outH = srcW;
+      for (int oy = 0; oy < outH; oy++) {
+        for (int ox = 0; ox < outW; ox++) {
+          final sx = srcW - 1 - oy;
+          final sy = ox;
+          final si = (sy * srcW + sx) * 4;
+          final di = (oy * outW + ox) * 4;
+          dst[di] = src[si];
+          dst[di + 1] = src[si + 1];
+          dst[di + 2] = src[si + 2];
+          dst[di + 3] = 255;
+        }
+      }
+    }
+    return dst;
   }
 
   InputImage? _buildInputImage(CameraImage image) {
@@ -209,62 +471,143 @@ class _VerificationScreenState extends State<VerificationScreen> {
   // detection keeps progressing. If a device pauses the stream, the staleness
   // detector below hides the frozen overlay and the post-recording grace
   // period in _onTimeout gives detection a chance to catch up.
-  Future<void> _startRecording() async {
+  /// Starts software-side video encoding. The camera plugin's MediaRecorder
+  /// is NEVER touched — we just begin forwarding the existing imageStream
+  /// frames into FlutterQuickVideoEncoder. Detection runs uninterrupted.
+  Future<void> _startRecording([CameraImage? firstFrame]) async {
     if (_recording || _videoUploaded || _controller == null) return;
-    if (_controller!.value.isRecordingVideo) return;
+    if (_encoderActive) return;
     try {
-      // Concurrent mode: do NOT stop the image stream. Modern Android phones
-      // (S20+, S22, S23 etc.) deliver frames at reduced rate during recording,
-      // which keeps detection alive. On devices that pause the stream the
-      // staleness detector below hides the (frozen) painter, so the user
-      // doesn't see misleading overlays.
-      await _controller!.startVideoRecording();
+      // Source encoder dimensions from the actual stream buffer if we have
+      // one (most reliable). Fall back to the controller's preview size only
+      // if no frame has arrived yet — but in practice _startRecording is only
+      // ever called from _onFrame, so a frame will always be available.
+      int w;
+      int h;
+      if (firstFrame != null) {
+        w = firstFrame.width;
+        h = firstFrame.height;
+      } else {
+        final preview = _controller!.value.previewSize;
+        if (preview == null) {
+          throw StateError('Camera preview size not yet available');
+        }
+        w = preview.width.toInt();
+        h = preview.height.toInt();
+      }
+      _srcWidth = w;
+      _srcHeight = h;
+      // Determine rotation degrees from camera sensor orientation. Most
+      // front cameras have 270° (Samsung) or 90° — both require swapping
+      // width/height so the encoded MP4 is portrait, matching how the user
+      // holds the phone.
+      switch (_rotation) {
+        case InputImageRotation.rotation90deg:
+          _encoderRotationDeg = 90;
+          break;
+        case InputImageRotation.rotation180deg:
+          _encoderRotationDeg = 180;
+          break;
+        case InputImageRotation.rotation270deg:
+          _encoderRotationDeg = 270;
+          break;
+        default:
+          _encoderRotationDeg = 0;
+      }
+      final swap = _encoderRotationDeg == 90 || _encoderRotationDeg == 270;
+      _encoderWidth = swap ? h : w;
+      _encoderHeight = swap ? w : h;
+      // Some encoders require even dimensions; clamp.
+      if (_encoderWidth.isOdd) _encoderWidth -= 1;
+      if (_encoderHeight.isOdd) _encoderHeight -= 1;
+      debugPrint(
+          '[VerificationScreen] encoder dims locked: ${_encoderWidth}x$_encoderHeight '
+          '(src=${_srcWidth}x$_srcHeight, rot=$_encoderRotationDeg°, '
+          'source=${firstFrame != null ? "stream-buffer" : "preview-size"})');
+
+      final tempDir = await getTemporaryDirectory();
+      _encoderOutputPath =
+          '${tempDir.path}/medverify_$_sessionId.mp4';
+
+      // 500 kbps × ~12 s typical session ≈ 750 KB.
+      // 500 kbps × 30 s worst-case ≈ 1.9 MB (the 30 s timeout fallback).
+      // For comparison: 1.5 Mbps was producing 3+ MB files. The face/mouth
+      // is small enough in the frame that 500 kbps still looks fine for
+      // the relative reviewer.
+      await FlutterQuickVideoEncoder.setup(
+        width: _encoderWidth,
+        height: _encoderHeight,
+        fps: 10,
+        videoBitrate: 500000,
+        audioBitrate: 0,
+        audioChannels: 0,
+        sampleRate: 0,
+        filepath: _encoderOutputPath!,
+        profileLevel: ProfileLevel.main41,
+      );
+      _encoderConfigured = true;
+      _encodedFrameCount = 0;
+      _lastEncodedFrameAt = null;
       if (!mounted) return;
       setState(() {
         _recording = true;
+        _encoderActive = true;
         _recordingStartedAt = DateTime.now();
-        _statusMessage = 'Kayıt başladı — hapı yutun ve su için';
+        _statusMessage =
+            'Kayıt başladı — detection paralel çalışıyor, hapı yutun ve su için';
       });
       _recordingTimeoutTimer?.cancel();
       _recordingTimeoutTimer = Timer(_recordingMaxDuration, _onTimeout);
-    } catch (e) {
-      debugPrint('[VerificationScreen] startRecording failed: $e');
-      if (mounted) setState(() => _recording = false);
+    } catch (e, st) {
+      debugPrint('[VerificationScreen] startRecording FAILED: $e\n$st');
+      _encoderConfigured = false;
+      if (mounted) {
+        setState(() {
+          _recording = false;
+          _encoderActive = false;
+          _statusMessage = 'KAYIT BAŞLATILAMADI: $e';
+        });
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Kayıt başlatılamadı: $e'),
+          backgroundColor: Colors.redAccent,
+          duration: const Duration(seconds: 6),
+        ));
+      }
     }
   }
 
+  /// Stops the software encoder and returns the finalized MP4 path.
+  /// The imageStream/camera controller are not touched — detection keeps
+  /// running until session end.
   Future<String?> _stopRecording() async {
-    if (!_recording || _controller == null) return null;
-    if (!_controller!.value.isRecordingVideo) return null;
+    if (!_recording) return null;
+    _recordingTimeoutTimer?.cancel();
+    _encoderActive = false;
+    if (mounted) setState(() => _recording = false);
+    if (!_encoderConfigured) return null;
     try {
-      final XFile file = await _controller!.stopVideoRecording();
-      _recordingTimeoutTimer?.cancel();
-      _recordedLocalPath = file.path;
-      if (mounted) setState(() => _recording = false);
-      // If the camera plugin paused the stream during recording (some devices
-      // do), restart it so swallow detection can finish post-recording.
-      await _resumeImageStreamIfNeeded();
-      return file.path;
+      // Wait briefly for any in-flight encode to finish before finalizing.
+      int waited = 0;
+      while (_encoderBusy && waited < 1000) {
+        await Future.delayed(const Duration(milliseconds: 25));
+        waited += 25;
+      }
+      await FlutterQuickVideoEncoder.finish();
     } catch (e) {
-      debugPrint('[VerificationScreen] stopRecording failed: $e');
-      if (mounted) setState(() => _recording = false);
-      await _resumeImageStreamIfNeeded();
-      return null;
+      debugPrint('[VerificationScreen] encoder.finish failed: $e');
     }
+    _encoderConfigured = false;
+    final p = _encoderOutputPath;
+    _encoderOutputPath = null;
+    _recordedLocalPath = p;
+    debugPrint(
+        '[VerificationScreen] encoder produced $_encodedFrameCount frames → $p');
+    return p;
   }
 
-  Future<void> _resumeImageStreamIfNeeded() async {
-    final c = _controller;
-    if (c == null) return;
-    if (c.value.isRecordingVideo) return;
-    if (c.value.isStreamingImages) return;
-    if (_completed) return;
-    try {
-      await c.startImageStream(_onFrame);
-    } catch (e) {
-      debugPrint('[VerificationScreen] resume stream failed: $e');
-    }
-  }
+  /// Kept as a noop for backwards compatibility with other call sites —
+  /// we never stop the imageStream anymore so there is nothing to resume.
+  Future<void> _resumeImageStreamIfNeeded() async {}
 
   Future<void> _discardLocalRecording() async {
     final path = _recordedLocalPath;
@@ -286,35 +629,93 @@ class _VerificationScreenState extends State<VerificationScreen> {
     } catch (_) {}
   }
 
+  /// Kept for callers that still expect this method (e.g. dev/manual tests).
+  /// In the normal flow finalization happens through [_onTimeout] when the
+  /// 30-second recording window completes — that ensures reviewers see the
+  /// entire process, not just up to the moment swallow was detected.
   Future<void> _finalizeSuccess() async {
-    if (_completed) return;
+    if (_completed || _finalizing) return;
+    _detectionSucceeded = true;
+    if (_recording) {
+      // Recording still in progress — let the timer drive the finalize step.
+      if (mounted) {
+        setState(() => _statusMessage =
+            'Yutma onaylandı — kayıt 30sn boyunca devam ediyor...');
+      }
+      return;
+    }
+    // Not recording (e.g. consent disabled, or _onTimeout already stopped it).
+    _finalizing = true;
     _completed = true;
     if (mounted) setState(() => _statusMessage = 'Yutma onaylandı.');
-    final localPath = await _stopRecording();
     await _saveAndUpload(
-      localPath: localPath,
+      localPath: _recordedLocalPath,
       userConfirmed: true,
       detectionConfirmed: true,
     );
-    if (mounted) setState(() => _statusMessage = 'Doğrulama başarılı.');
+    _setFinalStatusFromClassification();
   }
 
+  /// Recording window ended — this is the SINGLE finalization point.
+  /// Routes based on whether DetectionPhase.swallowConfirmed fired during the
+  /// recording (success), arrives within a short grace period (success), or
+  /// never arrives (manual confirmation dialog).
   Future<void> _onTimeout() async {
-    if (_completed) return;
-    if (mounted) setState(() => _statusMessage = 'Kayıt bitti — yutma doğrulanıyor...');
+    if (_completed || _finalizing) return;
+    // Block the mouth-open trigger immediately — even before _stopRecording
+    // sets _recording=false. Otherwise an in-flight frame can spawn a new
+    // _startRecording on the same file path while we're still finalizing.
+    _finalizing = true;
+    if (mounted) {
+      // Show the non-dismissible overlay from the moment the recording
+      // window closes; it stays up through compress + upload + Firestore
+      // write, until the centered completion dialog takes over.
+      setState(() {
+        _statusMessage = 'Kayıt tamamlandı — sonuç hazırlanıyor...';
+        _uploading = true;
+        _uploadProgress = 0.0;
+        _uploadStatus = 'Kayıt sonlandırılıyor...';
+      });
+    }
     await _stopRecording();
     if (!mounted) return;
-    // Grace period: give the resumed detection up to 10 seconds to catch
-    // DetectionPhase.swallowConfirmed before falling back to the user dialog.
-    final graceUntil = DateTime.now().add(const Duration(seconds: 10));
-    while (mounted && !_completed && DateTime.now().isBefore(graceUntil)) {
+
+    // Path A: detection confirmed swallow at any point during the 30s window.
+    if (_detectionSucceeded) {
+      _completed = true;
+      await _saveAndUpload(
+        localPath: _recordedLocalPath,
+        userConfirmed: true,
+        detectionConfirmed: true,
+      );
+      _setFinalStatusFromClassification();
+      return;
+    }
+
+    // Path B: detection did not confirm yet — wait briefly in case the last
+    // few frames promote to swallowConfirmed after the encoder shut down.
+    final graceUntil = DateTime.now().add(const Duration(seconds: 5));
+    while (mounted && !_detectionSucceeded &&
+        DateTime.now().isBefore(graceUntil)) {
       if (_lastResult.phase == DetectionPhase.swallowConfirmed) {
-        // _finalizeSuccess will be called from _onFrame
-        return;
+        _detectionSucceeded = true;
+        break;
       }
       await Future.delayed(const Duration(milliseconds: 250));
     }
-    if (!mounted || _completed) return;
+    if (_detectionSucceeded) {
+      _completed = true;
+      await _saveAndUpload(
+        localPath: _recordedLocalPath,
+        userConfirmed: true,
+        detectionConfirmed: true,
+      );
+      _setFinalStatusFromClassification();
+      return;
+    }
+
+    // Path C: ask the user to confirm manually.
+    if (!mounted) return;
     if (mounted) setState(() => _statusMessage = 'Otomatik doğrulanamadı.');
     final tookIt = await _showTimeoutDialog();
     if (!mounted) return;
@@ -325,11 +726,35 @@ class _VerificationScreenState extends State<VerificationScreen> {
         userConfirmed: true,
         detectionConfirmed: false,
       );
-      if (mounted) setState(() => _statusMessage = 'Onayınız kaydedildi.');
+      _setFinalStatusFromClassification();
     } else {
       await _discardLocalRecording();
       _resetForRetry();
     }
+  }
+
+  /// Maps the score-derived classification to the user-facing status
+  /// message so the UX never says "Doğrulama başarılı" when the score is
+  /// actually too low to count as a real verification.
+  void _setFinalStatusFromClassification() {
+    if (!mounted) return;
+    final scorePct = (_completionScore * 100).round();
+    final String message;
+    switch (_completionClassification) {
+      case 'success':
+        message = 'Doğrulama başarılı (%$scorePct).';
+        break;
+      case 'suspicious':
+        message =
+            'Doğrulama şüpheli (%$scorePct) — yakınınızın incelemesi bekleniyor.';
+        break;
+      case 'rejected':
+      default:
+        message =
+            'Doğrulama yetersiz (%$scorePct). Lütfen tekrar deneyin.';
+        break;
+    }
+    setState(() => _statusMessage = message);
   }
 
   Future<bool?> _showTimeoutDialog() {
@@ -373,11 +798,51 @@ class _VerificationScreenState extends State<VerificationScreen> {
     _mouthOpenFrames = 0;
     _pillOnTongueFrames = 0;
     _highestPhaseReached = DetectionPhase.noFace;
+    _detectionSucceeded = false;
+    _completed = false;
+    _finalizing = false;
     _service.reset();
-    if (mounted) setState(() => _statusMessage = 'Tekrar deneyin.');
+    if (mounted) {
+      setState(() {
+        _statusMessage = 'Tekrar deneyin.';
+        _uploading = false;
+        _uploadProgress = 0.0;
+        _uploadStatus = '';
+      });
+    }
   }
 
   Future<String> _compressVideo(String sourcePath) async {
+    // Defensive checks: skip compression if the file is empty, missing, or
+    // already small enough. Our software encoder produces a portrait MP4
+    // at 480x720@10fps@1.5Mbps — that's ~3 MB for 30 s, already well under
+    // any reasonable upload limit. Running video_compress on already-small
+    // files is risky: when its internal validator decides "no transcode
+    // needed", the plugin then tries to read metadata from a non-existent
+    // output path and crashes the host app with a SecurityException
+    // / setDataSource failure. We avoid that entirely by skipping when:
+    //   • file missing / empty (encoder failed)
+    //   • file < 8 MB (no real benefit, only crash risk)
+    int size = 0;
+    try {
+      final f = File(sourcePath);
+      final exists = await f.exists();
+      size = exists ? await f.length() : 0;
+      if (!exists || size < 1024) {
+        debugPrint(
+            '[VerificationScreen] compress SKIPPED: file empty/missing '
+            '(exists=$exists, size=$size, frames=$_encodedFrameCount)');
+        return sourcePath;
+      }
+    } catch (_) {}
+    const int compressThresholdBytes = 8 * 1024 * 1024; // 8 MB
+    if (size > 0 && size < compressThresholdBytes) {
+      debugPrint(
+          '[VerificationScreen] compress SKIPPED: file already small '
+          '(size=${(size / (1024 * 1024)).toStringAsFixed(2)} MB, '
+          'frames=$_encodedFrameCount). Uploading directly.');
+      return sourcePath;
+    }
     if (mounted) {
       setState(() {
         _uploading = true;
@@ -419,7 +884,19 @@ class _VerificationScreenState extends State<VerificationScreen> {
     final classification = _scoringEngine.classify(score);
     String footageUrl = '';
     String? storagePath;
+    String? uploadError;
     if (_consentEnabled && localPath != null && !_videoUploaded) {
+      // Verify file is non-empty BEFORE compress (crash guard)
+      final localFile = File(localPath);
+      final localExists = await localFile.exists();
+      final localSize = localExists ? await localFile.length() : 0;
+      if (!localExists || localSize < 1024 || _encodedFrameCount == 0) {
+        debugPrint(
+            '[VerificationScreen] upload SKIPPED: bad local file '
+            '(exists=$localExists, size=$localSize, frames=$_encodedFrameCount)');
+        uploadError =
+            'Kayıt boş ($_encodedFrameCount frame). Encoder frame alamadı.';
+      } else {
       final pathToUpload = await _compressVideo(localPath);
       if (mounted) setState(() => _uploadStatus = 'Sunucuya yükleniyor...');
       try {
@@ -436,6 +913,7 @@ class _VerificationScreenState extends State<VerificationScreen> {
         storagePath = upload.storagePath;
         _videoUploaded = true;
       } catch (e) {
+        uploadError = e.toString();
         debugPrint('[VerificationScreen] Upload failed: $e');
         if (mounted) setState(() => _uploadStatus = 'Yükleme başarısız.');
       } finally {
@@ -444,6 +922,7 @@ class _VerificationScreenState extends State<VerificationScreen> {
           if (await f.exists()) await f.delete();
         } catch (_) {}
       }
+      } // close else (non-empty local file branch)
     }
     if (mounted && _consentEnabled && localPath != null) {
       setState(() => _uploadStatus = 'Doğrulama kaydı yazılıyor...');
@@ -490,8 +969,187 @@ class _VerificationScreenState extends State<VerificationScreen> {
       setState(() {
         _uploading = false;
         _uploadStatus = '';
+        _completionFootageUrl = footageUrl.isEmpty ? null : footageUrl;
+        _completionStoragePath = storagePath;
+        _completionUploadError = uploadError;
+        _completionScore = score;
+        _completionClassification = classification.name;
+      });
+      // Auto-pop the centered completion dialog as soon as save+upload
+      // finishes. This replaces the bottom "Tamamla" button.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _showCompletionDialog();
       });
     }
+  }
+
+  Future<void> _showCompletionDialog() async {
+    if (!mounted) return;
+    final cls = _completionClassification;
+    Color color;
+    IconData icon;
+    String title;
+    switch (cls) {
+      case 'success':
+        color = AppColors.turquoise;
+        icon = Icons.verified_rounded;
+        title = 'Doğrulama Başarılı';
+        break;
+      case 'suspicious':
+        color = Colors.orange;
+        icon = Icons.help_outline_rounded;
+        title = 'Şüpheli Doğrulama';
+        break;
+      case 'rejected':
+        color = Colors.redAccent;
+        icon = Icons.cancel_rounded;
+        title = 'Doğrulama Başarısız';
+        break;
+      default:
+        color = AppColors.skyBlue;
+        icon = Icons.info_outline_rounded;
+        title = 'Doğrulama Tamamlandı';
+    }
+
+    final uploadOk = _completionFootageUrl != null &&
+        _completionFootageUrl!.isNotEmpty;
+    final consentSkipped = !_consentEnabled;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => Dialog(
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        backgroundColor: AppColors.surface,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Container(
+                width: 76,
+                height: 76,
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.12),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: color, size: 44),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: GoogleFonts.inter(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                  color: AppColors.deepSea,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Doğruluk: ${(_completionScore * 100).toStringAsFixed(0)}%',
+                style: GoogleFonts.inter(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                  color: color,
+                ),
+              ),
+              const SizedBox(height: 14),
+              if (consentSkipped)
+                _completionInfoRow(
+                  Icons.privacy_tip_rounded,
+                  'Video kaydı alınmadı (KVKK onayı kapalı).',
+                  Colors.amber.shade800,
+                )
+              else if (uploadOk)
+                _completionInfoRow(
+                  Icons.cloud_done_rounded,
+                  'Video sunucuya yüklendi. Yakınlarınız Yakın İncelemesi\'nden açabilir.',
+                  AppColors.turquoise,
+                )
+              else
+                _completionInfoRow(
+                  Icons.cloud_off_rounded,
+                  'Video YÜKLENEMEDİ: ${_completionUploadError ?? "bilinmeyen hata"}',
+                  Colors.redAccent,
+                ),
+              if (_completionStoragePath != null) ...[
+                const SizedBox(height: 6),
+                Text(
+                  _completionStoragePath!,
+                  style: TextStyle(
+                    fontSize: 9,
+                    color: Colors.grey.shade500,
+                    fontFamily: 'monospace',
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+              const SizedBox(height: 18),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () {
+                    // Clear the blocking flags so PopScope/overlay don't
+                    // interfere with the screen-pop that follows.
+                    if (mounted) {
+                      setState(() {
+                        _finalizing = false;
+                        _uploading = false;
+                      });
+                    }
+                    Navigator.of(ctx).pop();
+                    if (mounted) Navigator.of(context).pop();
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: color,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12)),
+                  ),
+                  child: Text(
+                    'Tamam',
+                    style: GoogleFonts.inter(
+                        fontWeight: FontWeight.w800, fontSize: 15),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _completionInfoRow(IconData icon, String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: GoogleFonts.inter(
+                fontSize: 12,
+                color: color,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   double _computeScore({required bool detectionConfirmed}) {
@@ -626,44 +1284,64 @@ class _VerificationScreenState extends State<VerificationScreen> {
   Widget build(BuildContext context) {
     final phase = _lastResult.phase;
     final accent = _phaseAccent(phase);
-    return Scaffold(
-      backgroundColor: AppColors.background,
-      appBar: AppBar(
-        title: Text('İlaç Doğrulama',
-            style: GoogleFonts.inter(
-                fontWeight: FontWeight.w800, color: AppColors.deepSea)),
-        centerTitle: true,
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        iconTheme: const IconThemeData(color: AppColors.deepSea),
-        actions: [
-          IconButton(
-            icon: Icon(
-                _torchOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
-                color: AppColors.deepSea),
-            onPressed: _isCameraInitialized ? _toggleTorch : null,
-          ),
-          IconButton(
-            icon:
-                const Icon(Icons.refresh_rounded, color: AppColors.deepSea),
-            onPressed: _completed
-                ? null
-                : () {
-                    _service.reset();
-                    setState(() {
-                      _lastResult = PillOnTongueResult.empty();
-                      _frameCount = 0;
-                      _facePresentFrames = 0;
-                      _mouthOpenFrames = 0;
-                      _pillOnTongueFrames = 0;
-                      _highestPhaseReached = DetectionPhase.noFace;
-                    });
-                  },
-          ),
-        ],
-      ),
-      body: Stack(
-        children: [
+    // True while finalization is happening — the recording's already done
+    // and we're processing/uploading the video. The fullscreen overlay
+    // below blocks all interaction until upload completes (then the
+    // completion dialog takes over).
+    final blocking = _finalizing || _uploading;
+    return PopScope(
+      // While blocking, intercept system back so the user can't exit until
+      // upload + classification finalize.
+      canPop: !blocking,
+      child: Scaffold(
+        backgroundColor: AppColors.background,
+        appBar: AppBar(
+          title: Text('İlaç Doğrulama',
+              style: GoogleFonts.inter(
+                  fontWeight: FontWeight.w800, color: AppColors.deepSea)),
+          centerTitle: true,
+          backgroundColor: Colors.transparent,
+          elevation: 0,
+          // Hide the back-arrow during finalization; replace with an explicit
+          // disabled icon so the user sees that exit is intentionally blocked.
+          automaticallyImplyLeading: !blocking,
+          leading: blocking
+              ? const Padding(
+                  padding: EdgeInsets.all(14),
+                  child: Icon(Icons.lock_clock_rounded,
+                      color: AppColors.deepSea),
+                )
+              : null,
+          iconTheme: const IconThemeData(color: AppColors.deepSea),
+          actions: [
+            IconButton(
+              icon: Icon(
+                  _torchOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
+                  color: AppColors.deepSea),
+              onPressed:
+                  (_isCameraInitialized && !blocking) ? _toggleTorch : null,
+            ),
+            IconButton(
+              icon:
+                  const Icon(Icons.refresh_rounded, color: AppColors.deepSea),
+              onPressed: (_completed || blocking)
+                  ? null
+                  : () {
+                      _service.reset();
+                      setState(() {
+                        _lastResult = PillOnTongueResult.empty();
+                        _frameCount = 0;
+                        _facePresentFrames = 0;
+                        _mouthOpenFrames = 0;
+                        _pillOnTongueFrames = 0;
+                        _highestPhaseReached = DetectionPhase.noFace;
+                      });
+                    },
+            ),
+          ],
+        ),
+        body: Stack(
+          children: [
           SafeArea(
             child: Column(
               children: [
@@ -717,11 +1395,9 @@ class _VerificationScreenState extends State<VerificationScreen> {
                           stepReached: (i) => _stepReached(phase, i),
                           phase: phase,
                         ),
-                        if (_completed) ...[
-                          const SizedBox(height: 12),
-                          _CompleteButton(
-                              onPressed: () => Navigator.of(context).pop()),
-                        ],
+                        // Bottom button removed — completion is now shown
+                        // via a centered dialog popped from _saveAndUpload.
+
                       ],
                     ),
                   ),
@@ -729,10 +1405,16 @@ class _VerificationScreenState extends State<VerificationScreen> {
               ],
             ),
           ),
-          if (_uploading)
-            _UploadOverlay(
-                progress: _uploadProgress, status: _uploadStatus),
-        ],
+            if (blocking)
+              _UploadOverlay(
+                progress: _uploadProgress,
+                status: _uploadStatus.isNotEmpty
+                    ? _uploadStatus
+                    : (_statusMessage ??
+                        'Kayıt tamamlanıyor — lütfen bekleyin...'),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -740,11 +1422,13 @@ class _VerificationScreenState extends State<VerificationScreen> {
   @override
   void dispose() {
     _recordingTimeoutTimer?.cancel();
+    if (_encoderConfigured) {
+      _encoderActive = false;
+      FlutterQuickVideoEncoder.finish().catchError((_) {});
+      _encoderConfigured = false;
+    }
     if (_controller?.value.isStreamingImages ?? false) {
       _controller?.stopImageStream().catchError((_) {});
-    }
-    if (_controller?.value.isRecordingVideo ?? false) {
-      _controller?.stopVideoRecording().catchError((_) => XFile(''));
     }
     _controller?.dispose();
     _service.dispose();
@@ -1395,3 +2079,4 @@ class _UploadOverlay extends StatelessWidget {
     );
   }
 }
+

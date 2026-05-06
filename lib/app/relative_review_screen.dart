@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -610,15 +612,24 @@ class _VideoPlayerCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Use the actual video aspect ratio when initialized so the preview
-    // doesn't get stretched (recordings are typically 4:3 or 3:4, not 16:9).
-    // Fall back to 16:9 only while loading or on error.
-    final aspect = (initialized &&
-            controller != null &&
-            controller!.value.isInitialized &&
-            controller!.value.aspectRatio > 0)
-        ? controller!.value.aspectRatio
-        : 16 / 9;
+    // All our recordings are produced by the in-app encoder in PORTRAIT
+    // orientation (480×720). Some Android MediaPlayer versions drop the
+    // orientation hint when reading our MP4 and report the natural size as
+    // 720×480 (landscape) — that's where the "yanlardan sündürülmüş" /
+    // sideways-stretched effect came from. Clamp the displayed aspect to
+    // portrait (≤ 1.0) by always using min/max of the two dimensions, so
+    // the video is shown taller than wide regardless of metadata weirdness.
+    double aspect = 9 / 16; // portrait fallback while loading
+    if (initialized &&
+        controller != null &&
+        controller!.value.isInitialized) {
+      final s = controller!.value.size;
+      if (s.width > 0 && s.height > 0) {
+        final shorter = math.min(s.width, s.height);
+        final longer = math.max(s.width, s.height);
+        aspect = shorter / longer; // always ≤ 1 → portrait
+      }
+    }
 
     return Container(
       decoration: BoxDecoration(
@@ -856,6 +867,14 @@ class _FullscreenVideoViewState extends State<_FullscreenVideoView> {
 
   @override
   Widget build(BuildContext context) {
+    // Same portrait-clamp as _VideoPlayerCard — see comment there.
+    final s = widget.controller.value.size;
+    double aspect = 9 / 16;
+    if (s.width > 0 && s.height > 0) {
+      final shorter = math.min(s.width, s.height);
+      final longer = math.max(s.width, s.height);
+      aspect = shorter / longer;
+    }
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
@@ -863,7 +882,7 @@ class _FullscreenVideoViewState extends State<_FullscreenVideoView> {
           children: [
             Center(
               child: AspectRatio(
-                aspectRatio: widget.controller.value.aspectRatio,
+                aspectRatio: aspect,
                 child: _VideoSurface(controller: widget.controller),
               ),
             ),

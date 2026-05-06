@@ -68,14 +68,14 @@ class PillOnTongueService {
   late final FaceDetector _faceDetector;
   late final ImageLabeler _imageLabeler;
 
-  static const double _mouthOpenThreshold = 0.06;
-  static const double _maxFrontalAngle = 30.0;
+  static const double _mouthOpenThreshold = 0.08;
+  static const double _maxFrontalAngle = 25.0;
 
-  static const double _pillPixelThreshold = 0.03;
-  static const double _pillConfidenceThreshold = 0.25;
-  static const int _brightnessThreshold = 140;
+  static const double _pillPixelThreshold = 0.05;
+  static const double _pillConfidenceThreshold = 0.4;
+  static const int _brightnessThreshold = 160;
 
-  static const int _requiredStableFrames = 3;
+  static const int _requiredStableFrames = 5;
   static const int _positionBufferSize = 10;
 
   // Drink-related substrings (ML Kit default model labels, lowercased).
@@ -92,8 +92,18 @@ class PillOnTongueService {
   static const Duration _drinkWarningAfter = Duration(seconds: 30);
   static const Duration _drinkTimeoutAfter = Duration(seconds: 60);
 
-  // Frames to wait when verifying swallow
-  static const int _swallowVerifyFrames = 8;
+  // Frames to wait when verifying swallow.
+  // Each frame must show a wide-open AND visibly empty mouth — see
+  // _handleVerifyingSwallow. 10 frames at ~10 fps ≈ 1.0 s of clear empty
+  // mouth required before swallow can be confirmed.
+  static const int _swallowVerifyFrames = 10;
+
+  // Maximum acceptable bright-pixel ratio inside the mouth region during
+  // swallow verification. Teeth alone produce ~5–8 % bright pixels under
+  // normal lighting; a pill on the tongue easily pushes that to 15–30 %.
+  // 0.12 = 12 % strikes a balance: it accepts visible teeth but rejects
+  // a still-present pill without forcing the user to hide their teeth.
+  static const double _emptyMouthMaxRatio = 0.12;
 
   // How many drink-label hits required before confirming drink (≈ N * interval)
   static const int _requiredDrinkHits = 3;
@@ -406,12 +416,60 @@ class PillOnTongueService {
       );
     }
 
+    // Gate the verify counter on TWO stronger signals:
+    //   (a) mouth must be visibly EMPTY — fewer than 2% bright pixels in
+    //       the mouth region. Just "no high-confidence pill detected"
+    //       is too lenient: it accepted an open-and-close-empty-mouth
+    //       loop because brief openings never produce bright clusters.
+    //   (b) mouth must be CLEARLY open (≥ 1.3× the open threshold), not
+    //       borderline. Borderline frames produced false confirms when
+    //       the user briefly parted lips without truly showing the
+    //       inside of the mouth.
+    final whiteRatio = (analysis != null && analysis.totalPixels > 0)
+        ? analysis.whitePixels / analysis.totalPixels
+        : 1.0; // unknown → treat as not-empty
+    final mouthClearlyEmpty = whiteRatio < _emptyMouthMaxRatio;
+    final mouthClearlyOpen = mouthOpenRatio >= _mouthOpenThreshold * 1.3;
+
+    if (!mouthClearlyOpen) {
+      // Don't increment — wait for the user to actually open wide.
+      return _emit(
+        phase: DetectionPhase.mouthReopened,
+        face: face,
+        mouthOpenRatio: mouthOpenRatio,
+        mouthRegion: mouthRect,
+        pillConfidence: analysis?.confidence ?? 0.0,
+        guidance: 'Ağzınızı daha geniş açın (yutma kontrolü)',
+        lastSeenPillRegion: _lastSeenPillRegion,
+        now: now,
+      );
+    }
+
+    if (!mouthClearlyEmpty) {
+      // Bright stuff in mouth → either pill still there or teeth/glare.
+      // Mark seen, do NOT increment toward swallowConfirmed.
+      _pillSeenInVerify = true;
+      return _emit(
+        phase: DetectionPhase.mouthReopened,
+        face: face,
+        mouthOpenRatio: mouthOpenRatio,
+        mouthRegion: mouthRect,
+        pillConfidence: analysis?.confidence ?? 0.0,
+        guidance: 'Ağzınızda parlak bir şey görünüyor — '
+            'dilinizi gösterip ağzınızın boş olduğunu kanıtlayın',
+        lastSeenPillRegion: _lastSeenPillRegion,
+        now: now,
+      );
+    }
+
+    // Mouth is wide open AND visibly empty for this frame.
     _swallowVerifyCounter++;
     if (pillDetected) _pillSeenInVerify = true;
 
     if (_swallowVerifyCounter >= _swallowVerifyFrames) {
       if (_pillSeenInVerify) {
-        // Pill still in mouth — go back and re-check after next close+reopen
+        // Pill still seen at any point during verification — fail and
+        // require another close+reopen cycle.
         _stage = _Stage.awaitingReopen;
         _swallowVerifyCounter = 0;
         _pillSeenInVerify = false;
@@ -580,18 +638,24 @@ class PillOnTongueService {
     final imgH = image.height;
     final bytesPerRow = image.planes.first.bytesPerRow;
 
-    // ML Kit face contour points are in ROTATED (upright) coords, but the
-    // Y-plane bytes are in raw SENSOR (buffer) coords. We must inverse-rotate
-    // the rect so brightness analysis hits the actual mouth, not the side.
+    // ML Kit returns face contour points in the ROTATED (upright) coordinate
+    // space, but the camera's Y-plane bytes live in the SENSOR (landscape)
+    // coordinate space. On phones with sensor orientation 90°/270° (i.e.
+    // basically every modern Android), using mouthRect as a buffer index
+    // hits a horizontal strip miles away from the actual mouth — that's why
+    // pill detection felt unreliable. Convert upright→buffer once here so
+    // the brightness scan looks at the real mouth pixels.
     int leftRaw, topRaw, rightRaw, bottomRaw;
     switch (rotation) {
       case InputImageRotation.rotation90deg:
+        // upright (rx, ry) → buffer (ry, imgH-1-rx)
         leftRaw = mouthRect.top.toInt();
         topRaw = (imgH - mouthRect.right).toInt();
         rightRaw = mouthRect.bottom.toInt();
         bottomRaw = (imgH - mouthRect.left).toInt();
         break;
       case InputImageRotation.rotation270deg:
+        // upright (rx, ry) → buffer (imgW-1-ry, rx)
         leftRaw = (imgW - mouthRect.bottom).toInt();
         topRaw = mouthRect.left.toInt();
         rightRaw = (imgW - mouthRect.top).toInt();
@@ -642,11 +706,11 @@ class PillOnTongueService {
 
     final ratio = whitePixels / totalPixels;
     double confidence;
-    if (ratio >= _pillPixelThreshold && ratio <= 0.55) {
-      confidence = ((ratio - _pillPixelThreshold) / (0.12 - _pillPixelThreshold))
+    if (ratio >= _pillPixelThreshold && ratio <= 0.45) {
+      confidence = ((ratio - _pillPixelThreshold) / (0.30 - _pillPixelThreshold))
           .clamp(0.0, 1.0);
-    } else if (ratio > 0.55) {
-      confidence = 0.35;
+    } else if (ratio > 0.45) {
+      confidence = 0.2;
     } else {
       confidence = 0.0;
     }
