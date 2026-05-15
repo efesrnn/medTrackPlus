@@ -936,8 +936,9 @@ class _VerificationScreenState extends State<VerificationScreen> {
         presenceDetected: _facePresentFrames > 0,
         appMode: _appMode,
         subScores: {
-          'pill': _frameCount == 0 ? 0.0 : _pillOnTongueFrames / _frameCount,
-          'mouth': _frameCount == 0 ? 0.0 : _mouthOpenFrames / _frameCount,
+          'pill': _facePresentFrames == 0 ? 0.0 : _pillOnTongueFrames / _facePresentFrames,
+          'lip': _frameCount == 0 ? 0.0 : _facePresentFrames / _frameCount,
+          'mouth': _facePresentFrames == 0 ? 0.0 : _mouthOpenFrames / _facePresentFrames,
           'detectionConfirmed': detectionConfirmed ? 1.0 : 0.0,
           'userConfirmed': userConfirmed ? 1.0 : 0.0,
         },
@@ -1154,15 +1155,33 @@ class _VerificationScreenState extends State<VerificationScreen> {
 
   double _computeScore({required bool detectionConfirmed}) {
     if (_frameCount == 0) return 0.0;
-    final pillRatio = _pillOnTongueFrames / _frameCount;
-    final mouthRatio = _mouthOpenFrames / _frameCount;
+
+    // Lip tracking: how many frames had a face detected (contour tracked).
+    final lipRatio = (_facePresentFrames / _frameCount).clamp(0.0, 1.0);
+
+    // Mouth open ratio among face-present frames (not total frames).
+    final mouthRatio = _facePresentFrames > 0
+        ? (_mouthOpenFrames / _facePresentFrames).clamp(0.0, 1.0)
+        : 0.0;
+
+    // Pill detection: ratio among face-present frames. If the full
+    // verification pipeline succeeded (swallowConfirmed), guarantee
+    // at least 0.8 — the pill WAS on the tongue, was consumed, and the
+    // swallow was verified; low frame-ratio shouldn't penalise the score.
+    final rawPillRatio = _facePresentFrames > 0
+        ? (_pillOnTongueFrames / _facePresentFrames).clamp(0.0, 1.0)
+        : 0.0;
+    final pillScore = detectionConfirmed
+        ? rawPillRatio.clamp(0.8, 1.0)
+        : rawPillRatio;
+
     return _scoringEngine.calculate(
       mode: _appMode == AppMode.device
           ? ScoringMode.withDevice
           : ScoringMode.deviceFree,
-      pill: pillRatio.clamp(0.0, 1.0),
-      lip: pillRatio.clamp(0.0, 1.0),
-      mouth: mouthRatio.clamp(0.0, 1.0),
+      pill: pillScore,
+      lip: lipRatio,
+      mouth: mouthRatio,
       timing: detectionConfirmed ? 1.0 : 0.4,
     );
   }

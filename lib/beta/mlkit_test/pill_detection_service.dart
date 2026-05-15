@@ -638,47 +638,13 @@ class PillOnTongueService {
     final imgH = image.height;
     final bytesPerRow = image.planes.first.bytesPerRow;
 
-    // ML Kit returns face contour points in the ROTATED (upright) coordinate
-    // space, but the camera's Y-plane bytes live in the SENSOR (landscape)
-    // coordinate space. On phones with sensor orientation 90°/270° (i.e.
-    // basically every modern Android), using mouthRect as a buffer index
-    // hits a horizontal strip miles away from the actual mouth — that's why
-    // pill detection felt unreliable. Convert upright→buffer once here so
-    // the brightness scan looks at the real mouth pixels.
-    int leftRaw, topRaw, rightRaw, bottomRaw;
-    switch (rotation) {
-      case InputImageRotation.rotation90deg:
-        // upright (rx, ry) → buffer (ry, imgH-1-rx)
-        leftRaw = mouthRect.top.toInt();
-        topRaw = (imgH - mouthRect.right).toInt();
-        rightRaw = mouthRect.bottom.toInt();
-        bottomRaw = (imgH - mouthRect.left).toInt();
-        break;
-      case InputImageRotation.rotation270deg:
-        // upright (rx, ry) → buffer (imgW-1-ry, rx)
-        leftRaw = (imgW - mouthRect.bottom).toInt();
-        topRaw = mouthRect.left.toInt();
-        rightRaw = (imgW - mouthRect.top).toInt();
-        bottomRaw = mouthRect.right.toInt();
-        break;
-      case InputImageRotation.rotation180deg:
-        leftRaw = (imgW - mouthRect.right).toInt();
-        topRaw = (imgH - mouthRect.bottom).toInt();
-        rightRaw = (imgW - mouthRect.left).toInt();
-        bottomRaw = (imgH - mouthRect.top).toInt();
-        break;
-      case InputImageRotation.rotation0deg:
-      case null:
-        leftRaw = mouthRect.left.toInt();
-        topRaw = mouthRect.top.toInt();
-        rightRaw = mouthRect.right.toInt();
-        bottomRaw = mouthRect.bottom.toInt();
-        break;
-    }
-    final left = leftRaw.clamp(0, imgW - 1);
-    final top = topRaw.clamp(0, imgH - 1);
-    final right = rightRaw.clamp(0, imgW - 1);
-    final bottom = bottomRaw.clamp(0, imgH - 1);
+    // ML Kit on Android returns contour coordinates in the raw buffer's own
+    // coordinate system (it applies rotation internally for detection only).
+    // İpek's proven original: use mouthRect directly — no rotation transform.
+    final left = mouthRect.left.toInt().clamp(0, imgW - 1);
+    final top = mouthRect.top.toInt().clamp(0, imgH - 1);
+    final right = mouthRect.right.toInt().clamp(0, imgW - 1);
+    final bottom = mouthRect.bottom.toInt().clamp(0, imgH - 1);
 
     if (right <= left || bottom <= top) {
       return _PillPixelAnalysis(0, 0, 0.0);
